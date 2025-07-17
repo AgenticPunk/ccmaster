@@ -296,37 +296,37 @@ CCMaster ──(Monitor)──> Status File ──(Parse)──> Display Update
 
 ## 🚀 Performance Optimizations
 
-1. **Process Detection Optimization**
-   - Uses `ps aux` instead of `pgrep` for reliability
-   - Retry mechanism to avoid false positives
-   - Precise filtering to exclude own process
+1. **Simplified Process Detection**
+   - Uses basic `pgrep` and `ps` commands for reliability
+   - No complex PID tracking or retries
+   - Tolerant monitoring (5 failures before declaring ended)
 
-2. **State Update Optimization**
-   - Updates display only on state changes
-   - Uses queue to avoid display conflicts
-   - Separates display logs from record logs
+2. **Streamlined Auto-Continue**
+   - Direct Terminal tab detection using AppleScript
+   - Two-tier fallback system for maximum reliability
+   - Clear success/failure feedback without complex timing
 
-3. **Keyboard Input Optimization**
-   - Non-blocking input doesn't affect main loop
-   - Properly saves and restores terminal settings
-   - Uses select to avoid CPU usage
+3. **Efficient Monitoring**
+   - Simple background thread checking every 2 seconds
+   - No complex process verification or multiple methods
+   - Minimal resource usage with straightforward logic
 
 ## 🔒 Error Handling
 
-1. **Process Monitoring Errors**
-   - Double-check to avoid false reports
-   - Continues running even if PID not found
-   - Detailed debug logging
+1. **Session Monitoring**
+   - Waits 3 seconds for Claude to start before monitoring
+   - Requires 5 consecutive failures before declaring session ended
+   - Clear feedback when sessions actually end
 
-2. **Hook Execution Errors**
-   - Always returns valid JSON
-   - Errors don't affect Claude Code operation
-   - Silent failures with logging
+2. **Auto-Continue Reliability**
+   - Primary method: Find Claude tab and send continue
+   - Fallback method: Send to frontmost Terminal window
+   - Clear error messages when auto-continue fails
 
-3. **Terminal Control Errors**
-   - Provides fallback options
-   - Uses key code as alternative
-   - Warns but doesn't interrupt monitoring
+3. **Graceful Degradation**
+   - If auto-continue fails, user gets clear instructions
+   - Session monitoring continues even if auto-continue breaks
+   - No complex fallback chains that can introduce bugs
 
 ## 📝 Summary
 

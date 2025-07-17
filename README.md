@@ -127,21 +127,29 @@ CCMaster uses a hooks-based architecture to monitor Claude Code:
 ### Key Components
 
 1. **Session Manager** (`ccmaster/bin/ccmaster`)
-   - Main orchestrator
-   - Manages Terminal windows via AppleScript
-   - Handles real-time monitoring
-   - Implements watch mode logic
+   - Main orchestrator with simplified, reliable design
+   - Simple Terminal launching via AppleScript
+   - Robust process monitoring using basic process detection
+   - Intelligent auto-continue with fallback methods
 
 2. **Hook System** (`ccmaster/hooks/`)
    - `pre_tool_use.py` - Tracks tool usage
    - `user_prompt_submit.py` - Captures user prompts
    - `stop_hook.py` - Detects when Claude finishes responding
-   - Each session gets its own hook configuration
+   - Each session gets its own isolated hook configuration
 
-3. **Status Tracking**
+3. **Monitoring System**
+   - Simple process detection (no complex PID tracking)
+   - Tolerant session monitoring (5 failures before declaring ended)
    - Real-time status files in `~/.ccmaster/status/`
    - Session logs in `~/.ccmaster/logs/`
    - User prompts in separate log files
+
+4. **Auto-Continue System**
+   - Direct Terminal tab detection for Claude processes
+   - Multi-tier fallback (find Claude tab → frontmost Terminal)
+   - Clear success/failure feedback
+   - No dependency on window focus or precise timing
 
 ## 🔧 Configuration
 
@@ -172,19 +180,21 @@ Note: CCMaster always uses the current working directory by default when startin
 ## 🐛 Troubleshooting
 
 ### Session ends immediately
-This usually happens when Claude process detection fails. CCMaster now includes:
-- Retry mechanism (10 attempts)
-- Better process filtering to exclude ccmaster itself
-- Debug logging for troubleshooting
+This is now much more reliable with the simplified approach:
+- CCMaster waits 3 seconds for Claude to start
+- Requires 5 consecutive failures (10 seconds) before declaring session ended
+- Uses simple process detection instead of complex PID tracking
 
 ### Auto-continue not working
 - Ensure you're in watch mode (green "Watch mode: ON" message)
 - Check that Claude has completed its response (shows "Idle" status)
-- Verify Terminal permissions for automation
+- CCMaster will show clear error messages if auto-continue fails
+- If the primary method fails, it will try sending to the frontmost Terminal
 
 ### Can't toggle watch mode
 - Make sure the ccmaster window has focus
 - The [w] key only works in the ccmaster monitoring window
+- Watch mode toggle works independently of Terminal focus
 
 ## 🤝 Contributing
 

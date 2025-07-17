@@ -85,12 +85,12 @@ Create a CLI tool called `ccmaster` that manages Claude Code sessions with the f
 - `ccmaster prompts SESSION_ID`: View user prompts
 
 ### Key Challenges Solved
-1. **Session Detection**: Improved process detection with retries and filtering
+1. **Simplified Session Detection**: Basic process detection without complex PID tracking
 2. **Hook Isolation**: Per-session hooks prevent conflicts between sessions
-3. **Duplicate Messages**: Only show idle from Stop hook, not from timeouts
-4. **Auto-Continue**: AppleScript automation for sending commands to Terminal
+3. **Reliable Auto-Continue**: Direct Terminal tab detection with two-tier fallback system
+4. **Robust Session Monitoring**: Tolerant monitoring (5 failures before declaring ended)
 5. **Turn Limiting**: Graceful handling of max turns with reset capability
-6. **Terminal Control**: Non-blocking keyboard input without affecting monitoring
+6. **Error Resilience**: Clear error messages and graceful degradation when automation fails
 
 ### Output Example
 ```
