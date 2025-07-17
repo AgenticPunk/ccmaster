@@ -1,0 +1,579 @@
+#!/usr/bin/env python3
+"""
+CCMaster - Claude Code Session Manager
+Manages Claude Code sessions with automatic terminal launching and continuous monitoring
+"""
+
+import os
+import sys
+import json
+import time
+import subprocess
+import argparse
+import threading
+import queue
+from pathlib import Path
+from datetime import datetime
+
+# Color codes for terminal output
+class Colors:
+    GREEN = '\033[92m'
+    RED = '\033[91m'
+    YELLOW = '\033[93m'
+    BLUE = '\033[94m'
+    RESET = '\033[0m'
+    BOLD = '\033[1m'
+
+class CCMaster:
+    def __init__(self):
+        self.config_dir = Path.home() / '.ccmaster'
+        self.config_file = self.config_dir / 'config.json'
+        self.sessions_file = self.config_dir / 'sessions.json'
+        self.status_dir = self.config_dir / 'status'
+        self.logs_dir = self.config_dir / 'logs'
+        self.hooks_dir = Path(__file__).resolve().parent.parent / 'hooks'
+        
+        # Create directories
+        self.config_dir.mkdir(exist_ok=True)
+        self.logs_dir.mkdir(exist_ok=True)
+        
+        # Initialize config
+        self.config = self.load_config()
+        self.sessions = self.load_sessions()
+        
+        # For live monitoring
+        self.log_queue = queue.Queue()
+        self.current_status = 'idle'
+    
+    def load_config(self):
+        """Load or create configuration"""
+        if self.config_file.exists():
+            with open(self.config_file) as f:
+                return json.load(f)
+        else:
+            config = {
+                'claude_code_command': 'claude',
+                'default_working_dir': str(Path.home()),
+                'monitor_interval': 0.5
+            }
+            with open(self.config_file, 'w') as f:
+                json.dump(config, f, indent=2)
+            return config
+    
+    def load_sessions(self):
+        """Load existing sessions"""
+        if self.sessions_file.exists():
+            with open(self.sessions_file) as f:
+                return json.load(f)
+        return {}
+    
+    def save_sessions(self):
+        """Save sessions to file"""
+        with open(self.sessions_file, 'w') as f:
+            json.dump(self.sessions, f, indent=2)
+    
+    def create_hooks_config(self, session_id):
+        """Create hooks configuration for Claude Code"""
+        hooks_config = {
+            "hooks": {
+                "PreToolUse": [
+                    {
+                        "matcher": ".*",
+                        "hooks": [
+                            {
+                                "type": "command",
+                                "command": f"python3 {self.hooks_dir}/pre_tool_use.py {session_id}"
+                            }
+                        ]
+                    }
+                ],
+                "UserPromptSubmit": [
+                    {
+                        "hooks": [
+                            {
+                                "type": "command",
+                                "command": f"python3 {self.hooks_dir}/user_prompt_submit.py {session_id}"
+                            }
+                        ]
+                    }
+                ],
+                "Stop": [
+                    {
+                        "hooks": [
+                            {
+                                "type": "command",
+                                "command": f"python3 {self.hooks_dir}/stop_hook.py {session_id}"
+                            }
+                        ]
+                    }
+                ]
+            }
+        }
+        
+        # Create Claude settings directory if it doesn't exist
+        claude_dir = Path.home() / '.claude'
+        claude_dir.mkdir(exist_ok=True)
+        
+        # Save current settings if they exist
+        settings_file = claude_dir / 'settings.json'
+        backup_file = claude_dir / 'settings.json.backup'
+        
+        if settings_file.exists():
+            with open(settings_file) as f:
+                existing_settings = json.load(f)
+            with open(backup_file, 'w') as f:
+                json.dump(existing_settings, f, indent=2)
+        
+        # Write our hooks configuration
+        with open(settings_file, 'w') as f:
+            json.dump(hooks_config, f, indent=2)
+        
+        return settings_file, backup_file if backup_file.exists() else None
+    
+    def restore_settings(self, backup_file):
+        """Restore original Claude settings"""
+        if backup_file and backup_file.exists():
+            settings_file = Path.home() / '.claude' / 'settings.json'
+            with open(backup_file) as f:
+                settings = json.load(f)
+            with open(settings_file, 'w') as f:
+                json.dump(settings, f, indent=2)
+            backup_file.unlink()
+    
+    def log_event(self, session_id, event_type, message, display=True):
+        """Log an event for a session"""
+        timestamp = datetime.now()
+        log_entry = {
+            'timestamp': timestamp.isoformat(),
+            'type': event_type,
+            'message': message
+        }
+        
+        # Write to log file
+        log_file = self.logs_dir / f'{session_id}.log'
+        with open(log_file, 'a') as f:
+            f.write(json.dumps(log_entry) + '\n')
+        
+        # Add to queue for live display if display is True
+        if display:
+            self.log_queue.put((timestamp, event_type, message))
+    
+    def get_latest_prompt(self, session_id):
+        """Get the latest user prompt for display"""
+        prompt_log_file = self.logs_dir / f'{session_id}_prompts.log'
+        if prompt_log_file.exists():
+            try:
+                with open(prompt_log_file, 'r') as f:
+                    lines = f.readlines()
+                    if lines:
+                        last_entry = json.loads(lines[-1])
+                        return last_entry.get('prompt', '')
+            except:
+                pass
+        return None
+    
+    def monitor_status(self, session_id):
+        """Monitor status file for changes"""
+        last_status = None
+        last_update = None
+        status_file = self.status_dir / f'{session_id}.json'
+        
+        while True:
+            try:
+                if status_file.exists():
+                    with open(status_file) as f:
+                        session_status = json.load(f)
+                        current_state = session_status.get('state', 'idle')
+                        current_tool = session_status.get('last_tool', '')
+                        current_action = session_status.get('current_action', '')
+                        timestamp = session_status.get('timestamp', '')
+                        
+                        # Check if status changed
+                        if current_state != last_status or timestamp != last_update:
+                            last_status = current_state
+                            last_update = timestamp
+                            self.current_status = current_state
+                            
+                            # Log the status change with meaningful messages
+                            if current_state == 'working':
+                                # Extract tool name from action if available
+                                tool_info = current_action.replace('Using ', '')
+                                self.log_event(session_id, 'TOOL', f'Using {tool_info}')
+                            elif current_state == 'idle':
+                                # Only show idle from Stop hook (Response complete)
+                                if 'Response complete' in current_action:
+                                    self.log_event(session_id, 'STATUS', 'Idle')
+                            elif current_state == 'processing':
+                                # Get and display the user prompt
+                                latest_prompt = self.get_latest_prompt(session_id)
+                                if latest_prompt and latest_prompt.strip() != 'continue':
+                                    # Only show non-continue prompts (continue is shown by auto-continue)
+                                    # Truncate long prompts for display
+                                    display_prompt = latest_prompt[:100] + '...' if len(latest_prompt) > 100 else latest_prompt
+                                    # Remove newlines for cleaner display
+                                    display_prompt = display_prompt.replace('\n', ' ')
+                                    self.log_event(session_id, 'USER', f'"{display_prompt}"')
+                                self.log_event(session_id, 'STATUS', 'Processing')
+                
+                time.sleep(0.2)  # Check status frequently
+                
+            except Exception as e:
+                # Don't log errors for missing status file
+                pass
+    
+    def monitor_process(self, session_id, pid):
+        """Monitor Claude process"""
+        while True:
+            try:
+                # Check if process is still running
+                result = subprocess.run(['ps', '-p', str(pid)], capture_output=True)
+                if result.returncode != 0:
+                    self.log_event(session_id, 'SESSION_END', 'Claude session ended')
+                    self.sessions[session_id]['status'] = 'ended'
+                    self.sessions[session_id]['ended_at'] = datetime.now().isoformat()
+                    self.save_sessions()
+                    break
+                
+                time.sleep(self.config['monitor_interval'])
+                
+            except Exception as e:
+                self.log_event(session_id, 'ERROR', f'Process monitoring error: {str(e)}')
+                break
+    
+    def find_claude_pid(self):
+        """Find the PID of the Claude process"""
+        time.sleep(2)  # Wait for process to start
+        
+        result = subprocess.run(['pgrep', '-f', self.config['claude_code_command']], 
+                                capture_output=True, text=True)
+        if result.returncode == 0:
+            pids = result.stdout.strip().split('\n')
+            return int(pids[-1]) if pids else None
+        return None
+    
+    def send_prompt_to_terminal(self, window_id, prompt):
+        """Send a prompt to the Claude terminal window"""
+        # Clear any interrupted state first by sending a newline
+        clear_script = f'''
+        tell application "Terminal"
+            activate
+            set frontmost of window id {window_id} to true
+            delay 0.3
+        end tell
+        
+        tell application "System Events"
+            tell process "Terminal"
+                -- Send a return first to clear any interrupted state
+                keystroke return
+                delay 0.2
+                -- Now type the prompt
+                keystroke "{prompt}"
+                delay 0.1
+                -- Send return to execute
+                keystroke return
+            end tell
+        end tell
+        '''
+        
+        try:
+            result = subprocess.run(['osascript', '-e', clear_script], 
+                                  capture_output=True, text=True)
+            
+            if result.returncode != 0:
+                # Fallback: Try with key code for return instead
+                fallback_script = f'''
+                tell application "Terminal"
+                    activate
+                end tell
+                
+                delay 0.5
+                
+                tell application "System Events"
+                    -- Clear line with return
+                    key code 36
+                    delay 0.2
+                    -- Type prompt
+                    keystroke "{prompt}"
+                    delay 0.1
+                    -- Execute with return
+                    key code 36
+                end tell
+                '''
+                
+                subprocess.run(['osascript', '-e', fallback_script])
+                
+        except Exception as e:
+            print(f"[Warning] Auto-continue may have failed: {e}")
+    
+    def format_status_line(self, status):
+        """Format status line with color"""
+        if status == 'working':
+            return f"{Colors.GREEN}● Working{Colors.RESET}"
+        elif status == 'idle':
+            return f"{Colors.RED}● Idle{Colors.RESET}"
+        elif status == 'processing':
+            return f"{Colors.YELLOW}● Processing{Colors.RESET}"
+        elif status == 'thinking':
+            return f"{Colors.BLUE}● Thinking{Colors.RESET}"
+        else:
+            return f"{Colors.BLUE}● {status.capitalize()}{Colors.RESET}"
+    
+    def start_session_and_monitor(self, working_dir=None, watch_mode=False):
+        """Start a new Claude Code session and monitor it"""
+        session_id = datetime.now().strftime('%Y%m%d_%H%M%S')
+        working_dir = working_dir or self.config['default_working_dir']
+        
+        # Create session entry
+        self.sessions[session_id] = {
+            'id': session_id,
+            'started_at': datetime.now().isoformat(),
+            'working_dir': working_dir,
+            'status': 'starting',
+            'last_activity': datetime.now().isoformat()
+        }
+        self.save_sessions()
+        
+        print(f"\n🚀 Starting Claude session in {working_dir}")
+        print(f"📍 Session ID: {session_id}")
+        if watch_mode:
+            print(f"👁️  Watch mode: Will auto-continue after idle\n")
+        else:
+            print()
+        
+        self.log_event(session_id, 'SESSION_START', f'Starting in {working_dir}', display=False)
+        
+        # Create per-session hooks configuration
+        settings_file, backup_file = self.create_hooks_config(session_id)
+        self.log_event(session_id, 'HOOKS', f'Created hooks configuration for session', display=False)
+        
+        # Prepare Claude Code command
+        claude_cmd = self.config['claude_code_command']
+        
+        # Create AppleScript to open new Terminal window
+        applescript = f'''
+        tell application "Terminal"
+            activate
+            set newWindow to do script "cd {working_dir} && {claude_cmd}"
+            return id of window 1
+        end tell
+        '''
+        
+        # Execute AppleScript
+        result = subprocess.run(['osascript', '-e', applescript], 
+                                capture_output=True, text=True)
+        
+        window_id = None
+        if result.returncode == 0:
+            window_id = result.stdout.strip()
+            self.log_event(session_id, 'TERMINAL', f'Opened Terminal window {window_id}', display=False)
+        
+        # Update session status
+        self.sessions[session_id]['status'] = 'running'
+        self.save_sessions()
+        
+        # Find Claude process
+        pid = self.find_claude_pid()
+        if pid:
+            self.sessions[session_id]['pid'] = pid
+            self.save_sessions()
+            self.log_event(session_id, 'PROCESS', f'Claude process started with PID {pid}', display=False)
+        
+        # Start monitoring threads
+        if pid:
+            process_thread = threading.Thread(
+                target=self.monitor_process, 
+                args=(session_id, pid),
+                daemon=True
+            )
+            process_thread.start()
+        
+        # Start status monitoring thread
+        status_thread = threading.Thread(
+            target=self.monitor_status,
+            args=(session_id,),
+            daemon=True
+        )
+        status_thread.start()
+        
+        # Initial status
+        current_status_display = self.format_status_line('idle')
+        has_seen_first_prompt = False
+        auto_continue_pending = False
+        continue_countdown = 0
+        terminal_window_id = window_id  # Store window ID for auto-continue
+        
+        try:
+            while True:
+                # Check if session is still running
+                if session_id in self.sessions and self.sessions[session_id]['status'] == 'ended':
+                    print(f"\r\n🛑 Session ended")
+                    break
+                
+                # Display queued log messages
+                try:
+                    while True:
+                        timestamp, event_type, message = self.log_queue.get_nowait()
+                        
+                        time_str = timestamp.strftime('%H:%M:%S')
+                        
+                        if event_type == 'STATUS':
+                            # Format main status updates
+                            if 'Processing' in message:
+                                status_display = self.format_status_line('processing')
+                                print(f"[{time_str}] {status_display}")
+                            elif 'Thinking' in message:
+                                status_display = self.format_status_line('thinking')
+                                print(f"[{time_str}] {status_display}")
+                            elif 'Idle' in message:
+                                status_display = self.format_status_line('idle')
+                                print(f"[{time_str}] {status_display}")
+                                # In watch mode, auto-continue after first prompt
+                                if watch_mode and has_seen_first_prompt:
+                                    auto_continue_pending = True
+                                    continue_countdown = 1
+                            current_status_display = status_display
+                            
+                        elif event_type == 'USER':
+                            # Format user prompt
+                            print(f"[{time_str}] {Colors.BLUE}▶{Colors.RESET} User: {message}")
+                            has_seen_first_prompt = True
+                            
+                        elif event_type == 'TOOL':
+                            # Format tool activity updates
+                            if 'Using' in message:
+                                tool_name = message.replace('Using ', '')
+                                print(f"[{time_str}] {Colors.GREEN}→{Colors.RESET} {message}")
+                            elif 'Completed' in message:
+                                tool_name = message.replace('Completed ', '')
+                                print(f"[{time_str}] {Colors.BLUE}✓{Colors.RESET} {message}")
+                                
+                        elif event_type == 'SESSION_END':
+                            print(f"\n[{time_str}] 🛑 {message}")
+                        
+                except queue.Empty:
+                    pass
+                
+                # Handle auto-continue in watch mode
+                if watch_mode and auto_continue_pending and continue_countdown > 0:
+                    time.sleep(1)  # Count down 1 second
+                    continue_countdown -= 1
+                    
+                    if continue_countdown == 0:
+                        # Send continue command via AppleScript
+                        self.send_prompt_to_terminal(terminal_window_id, "continue")
+                        auto_continue_pending = False
+                        # Log the auto-continue with special formatting
+                        timestamp = datetime.now()
+                        time_str = timestamp.strftime('%H:%M:%S')
+                        print(f"[{time_str}] {Colors.GREEN}▶ Auto-continue{Colors.RESET}")
+                        # Don't log to queue to avoid duplicate
+                else:
+                    time.sleep(0.1)
+                
+        except KeyboardInterrupt:
+            print(f"\n\n✋ Stopped monitoring (Claude continues running)")
+            print(f"📝 View full logs: ccmaster logs {session_id}")
+        finally:
+            # Restore original settings if we have a backup
+            if 'backup_file' in locals() and backup_file:
+                self.restore_settings(backup_file)
+    
+    def list_sessions(self):
+        """List all sessions"""
+        if not self.sessions:
+            print("No sessions found")
+            return
+        
+        print("Claude Code Sessions:")
+        print("-" * 80)
+        for session_id, session in self.sessions.items():
+            status_icon = "🟢" if session['status'] == 'running' else "⚫"
+            print(f"{status_icon} Session: {session_id}")
+            print(f"   Started: {session['started_at']}")
+            print(f"   Status: {session['status']}")
+            print(f"   Directory: {session['working_dir']}")
+            if 'pid' in session:
+                print(f"   PID: {session['pid']}")
+            if 'ended_at' in session:
+                print(f"   Ended: {session['ended_at']}")
+            print()
+    
+    def view_logs(self, session_id):
+        """View logs for a specific session"""
+        log_file = self.logs_dir / f'{session_id}.log'
+        if not log_file.exists():
+            print(f"No logs found for session {session_id}")
+            return
+        
+        print(f"Logs for session {session_id}:")
+        print("-" * 60)
+        
+        with open(log_file) as f:
+            for line in f:
+                entry = json.loads(line)
+                timestamp = datetime.fromisoformat(entry['timestamp'])
+                print(f"[{timestamp.strftime('%H:%M:%S')}] {entry['type']}: {entry['message']}")
+    
+    def view_prompts(self, session_id):
+        """View all user prompts for a specific session"""
+        prompt_file = self.logs_dir / f'{session_id}_prompts.log'
+        if not prompt_file.exists():
+            print(f"No prompts found for session {session_id}")
+            return
+        
+        print(f"User prompts for session {session_id}:")
+        print("-" * 60)
+        
+        with open(prompt_file) as f:
+            for i, line in enumerate(f, 1):
+                entry = json.loads(line)
+                timestamp = datetime.fromisoformat(entry['timestamp'])
+                prompt = entry['prompt']
+                print(f"\n[{i}] {timestamp.strftime('%Y-%m-%d %H:%M:%S')}")
+                print(f"Prompt: {prompt}")
+                print("-" * 60)
+
+def main():
+    parser = argparse.ArgumentParser(description='CCMaster - Claude Code Session Manager')
+    subparsers = parser.add_subparsers(dest='command', help='Commands')
+    
+    # Start command (default)
+    start_parser = subparsers.add_parser('start', help='Start and monitor a new Claude session')
+    start_parser.add_argument('-d', '--dir', help='Working directory', default=None)
+    
+    # Watch command
+    watch_parser = subparsers.add_parser('watch', help='Start in watch mode (auto-continue)')
+    watch_parser.add_argument('-d', '--dir', help='Working directory', default=None)
+    
+    # List command
+    subparsers.add_parser('list', help='List all sessions')
+    
+    # Logs command
+    logs_parser = subparsers.add_parser('logs', help='View session logs')
+    logs_parser.add_argument('session', help='Session ID')
+    
+    # Prompts command
+    prompts_parser = subparsers.add_parser('prompts', help='View user prompts for a session')
+    prompts_parser.add_argument('session', help='Session ID')
+    
+    args = parser.parse_args()
+    
+    cc = CCMaster()
+    
+    if args.command == 'start' or args.command is None:
+        # Default to start if no command given
+        working_dir = args.dir if args.command == 'start' else None
+        cc.start_session_and_monitor(working_dir, watch_mode=False)
+    elif args.command == 'watch':
+        cc.start_session_and_monitor(args.dir, watch_mode=True)
+    elif args.command == 'list':
+        cc.list_sessions()
+    elif args.command == 'logs':
+        cc.view_logs(args.session)
+    elif args.command == 'prompts':
+        cc.view_prompts(args.session)
+    else:
+        parser.print_help()
+
+if __name__ == '__main__':
+    main()
