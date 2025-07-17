@@ -1,58 +1,58 @@
-# CCMaster 实现指南
+# CCMaster Implementation Guide
 
-本文档详细说明了 CCMaster 的内部实现原理、架构设计和技术方案。
+This document provides detailed information about CCMaster's internal implementation, architecture design, and technical solutions.
 
-## 📐 架构概述
+## 📐 Architecture Overview
 
-CCMaster 采用基于事件驱动的架构，通过 Claude Code 的钩子系统实现对会话的实时监控：
+CCMaster uses an event-driven architecture that monitors Claude Code sessions in real-time through its hooks system:
 
 ```
 ┌──────────────────────────────────────────────────────────────┐
-│                         用户界面层                            │
+│                      User Interface Layer                     │
 │  ┌─────────────┐  ┌──────────────┐  ┌──────────────────┐   │
-│  │  命令解析   │  │   状态显示   │  │   键盘交互(w)   │   │
+│  │Command Parser│  │Status Display│  │Keyboard Input(w) │   │
 │  └─────────────┘  └──────────────┘  └──────────────────┘   │
 └──────────────────────────────────────────────────────────────┘
                                │
 ┌──────────────────────────────────────────────────────────────┐
-│                         核心逻辑层                            │
+│                       Core Logic Layer                        │
 │  ┌─────────────┐  ┌──────────────┐  ┌──────────────────┐   │
-│  │ 会话管理器  │  │  监视模式    │  │   轮次控制器    │   │
+│  │Session Manager│ │  Watch Mode  │  │ Turn Controller  │   │
 │  └─────────────┘  └──────────────┘  └──────────────────┘   │
 └──────────────────────────────────────────────────────────────┘
                                │
 ┌──────────────────────────────────────────────────────────────┐
-│                         监控系统层                            │
+│                     Monitoring System Layer                   │
 │  ┌─────────────┐  ┌──────────────┐  ┌──────────────────┐   │
-│  │ 进程监控器  │  │  状态监控器  │  │   日志收集器    │   │
+│  │Process Monitor│ │Status Monitor│  │  Log Collector   │   │
 │  └─────────────┘  └──────────────┘  └──────────────────┘   │
 └──────────────────────────────────────────────────────────────┘
                                │
 ┌──────────────────────────────────────────────────────────────┐
-│                          钩子系统                             │
+│                         Hooks System                          │
 │  ┌─────────────┐  ┌──────────────┐  ┌──────────────────┐   │
 │  │PreToolUse   │  │UserPromptSubmit│ │    Stop Hook    │   │
 │  └─────────────┘  └──────────────┘  └──────────────────┘   │
 └──────────────────────────────────────────────────────────────┘
 ```
 
-## 🔧 核心实现原理
+## 🔧 Core Implementation Principles
 
-### 1. 会话管理 (Session Management)
+### 1. Session Management
 
-每个会话都有唯一的 ID（格式：`YYYYMMDD_HHMMSS`），用于：
-- 隔离不同会话的钩子配置
-- 跟踪会话状态和日志
-- 管理会话生命周期
+Each session has a unique ID (format: `YYYYMMDD_HHMMSS`) used for:
+- Isolating hook configurations between sessions
+- Tracking session state and logs
+- Managing session lifecycle
 
 ```python
 def start_session_and_monitor(self, working_dir=None, watch_mode=False, max_turns=None):
     session_id = datetime.now().strftime('%Y%m%d_%H%M%S')
     
-    # 创建会话级钩子配置
+    # Create per-session hooks configuration
     settings_file, backup_file = self.create_hooks_config(session_id)
     
-    # 启动 Claude Code
+    # Launch Claude Code
     applescript = f'''
     tell application "Terminal"
         activate
@@ -62,14 +62,14 @@ def start_session_and_monitor(self, working_dir=None, watch_mode=False, max_turn
     '''
 ```
 
-### 2. 钩子系统 (Hooks System)
+### 2. Hooks System
 
-CCMaster 使用三种钩子来监控 Claude Code 的状态：
+CCMaster uses three hooks to monitor Claude Code's state:
 
 #### PreToolUse Hook
-- **触发时机**：Claude 即将使用工具时
-- **获取信息**：工具名称
-- **状态更新**：设置为 "working"
+- **Trigger**: When Claude is about to use a tool
+- **Information**: Tool name
+- **State Update**: Set to "working"
 
 ```python
 def main():
@@ -81,9 +81,9 @@ def main():
 ```
 
 #### UserPromptSubmit Hook
-- **触发时机**：用户提交新提示词时
-- **获取信息**：用户输入的完整提示词
-- **状态更新**：设置为 "processing"
+- **Trigger**: When user submits a new prompt
+- **Information**: Complete user prompt
+- **State Update**: Set to "processing"
 
 ```python
 def main():
@@ -92,7 +92,7 @@ def main():
     data = utils.read_hook_input()
     user_prompt = data.get('prompt', '')
     
-    # 保存提示词到专门的日志文件
+    # Save prompt to dedicated log file
     with open(prompt_log_file, 'a') as f:
         log_entry = {
             'timestamp': datetime.now().isoformat(),
@@ -102,13 +102,13 @@ def main():
 ```
 
 #### Stop Hook
-- **触发时机**：Claude 完成响应时
-- **获取信息**：响应完成信号
-- **状态更新**：设置为 "idle"
+- **Trigger**: When Claude completes its response
+- **Information**: Response completion signal
+- **State Update**: Set to "idle"
 
-### 3. 进程监控 (Process Monitoring)
+### 3. Process Monitoring
 
-使用改进的进程检测机制：
+Enhanced process detection mechanism:
 
 ```python
 def find_claude_pid(self, max_attempts=10):
@@ -119,7 +119,7 @@ def find_claude_pid(self, max_attempts=10):
         result = subprocess.run(['ps', 'aux'], capture_output=True, text=True)
         
         for line in result.stdout.strip().split('\n'):
-            # 排除 ccmaster 自身和 python 进程
+            # Exclude ccmaster itself and python processes
             if self.config['claude_code_command'] in line \
                and 'ccmaster' not in line \
                and 'python' not in line:
@@ -128,32 +128,32 @@ def find_claude_pid(self, max_attempts=10):
                     return pid
 ```
 
-### 4. 监视模式 (Watch Mode)
+### 4. Watch Mode
 
-监视模式的核心逻辑：
+Core watch mode logic:
 
 ```python
-# 检测到空闲状态时
+# When idle state is detected
 if 'Idle' in message:
     if watch_mode and has_seen_first_prompt:
-        # 检查是否达到最大轮次
+        # Check if max turns reached
         if max_turns is None or auto_continue_count < max_turns:
             auto_continue_pending = True
             continue_countdown = 1
         else:
-            # 达到最大轮次，自动关闭监视模式
+            # Max turns reached, auto-disable watch mode
             print(f"🛑 Max auto-continue turns ({max_turns}) reached")
             watch_mode = False
 
-# 发送自动续写命令
+# Send auto-continue command
 if continue_countdown == 0:
     self.send_prompt_to_terminal(terminal_window_id, "continue")
     auto_continue_count += 1
 ```
 
-### 5. 键盘交互 (Keyboard Interaction)
+### 5. Keyboard Interaction
 
-使用非阻塞输入检测：
+Non-blocking input detection:
 
 ```python
 def check_keyboard_input(self):
@@ -161,23 +161,23 @@ def check_keyboard_input(self):
         return sys.stdin.read(1)
     return None
 
-# 在主循环中
+# In main loop
 key = self.check_keyboard_input()
 if key == 'w':
     was_at_max_turns = max_turns and auto_continue_count >= max_turns
     watch_mode = not watch_mode
     
     if watch_mode and was_at_max_turns:
-        # 重置计数器
+        # Reset counter
         auto_continue_count = 0
-        # 如果当前空闲，立即续写
+        # If currently idle, continue immediately
         if self.current_status == 'idle':
             self.send_prompt_to_terminal(terminal_window_id, "continue")
 ```
 
-### 6. 自动续写控制 (Auto-Continue Control)
+### 6. Auto-Continue Control
 
-通过 AppleScript 发送命令到终端：
+Sending commands to Terminal via AppleScript:
 
 ```python
 def send_prompt_to_terminal(self, window_id, prompt):
@@ -189,7 +189,7 @@ def send_prompt_to_terminal(self, window_id, prompt):
     
     tell application "System Events"
         tell process "Terminal"
-            keystroke return  -- 清除任何中断状态
+            keystroke return  -- Clear any interrupted state
             delay 0.2
             keystroke "{prompt}"
             keystroke return
@@ -198,9 +198,9 @@ def send_prompt_to_terminal(self, window_id, prompt):
     '''
 ```
 
-## 📊 数据流程
+## 📊 Data Flow
 
-### 状态更新流程
+### State Update Flow
 
 ```
 Claude Code ──(Hook Event)──> Hook Script ──(Update)──> Status File
@@ -212,36 +212,36 @@ CCMaster ──(Monitor)──> Status File ──(Parse)──> Display Update
                               └──(Queue)──> Real-time Display
 ```
 
-### 自动续写流程
+### Auto-Continue Flow
 
 ```
-1. Stop Hook 触发 ──> 状态设为 "idle"
-2. CCMaster 检测到 idle 状态
-3. 检查条件：
-   - 是否在监视模式
-   - 是否已看到第一个提示词
-   - 是否未达到最大轮次
-4. 如果满足条件 ──> 1秒倒计时
-5. 倒计时结束 ──> AppleScript 发送 "continue"
-6. 更新计数器
+1. Stop Hook triggers ──> State set to "idle"
+2. CCMaster detects idle state
+3. Check conditions:
+   - In watch mode?
+   - Has seen first prompt?
+   - Under max turns limit?
+4. If conditions met ──> 1-second countdown
+5. Countdown ends ──> AppleScript sends "continue"
+6. Update counter
 ```
 
-## 🛠 技术细节
+## 🛠 Technical Details
 
-### 文件结构
+### File Structure
 
 ```
 ~/.ccmaster/
-├── config.json              # 全局配置
-├── sessions.json            # 会话元数据
-├── status/                  # 实时状态
-│   └── {session_id}.json    # 单个会话状态
-└── logs/                    # 日志文件
-    ├── {session_id}.log     # 会话事件日志
-    └── {session_id}_prompts.log  # 用户提示词日志
+├── config.json              # Global configuration
+├── sessions.json            # Session metadata
+├── status/                  # Real-time status
+│   └── {session_id}.json    # Individual session status
+└── logs/                    # Log files
+    ├── {session_id}.log     # Session event log
+    └── {session_id}_prompts.log  # User prompts log
 ```
 
-### 状态文件格式
+### Status File Format
 
 ```json
 {
@@ -253,7 +253,7 @@ CCMaster ──(Monitor)──> Status File ──(Parse)──> Display Update
 }
 ```
 
-### 会话元数据格式
+### Session Metadata Format
 
 ```json
 {
@@ -268,73 +268,73 @@ CCMaster ──(Monitor)──> Status File ──(Parse)──> Display Update
 }
 ```
 
-## 🔍 关键技术决策
+## 🔍 Key Technical Decisions
 
-### 1. 为什么使用会话级钩子？
+### 1. Why Per-Session Hooks?
 
-- **隔离性**：每个会话独立，互不干扰
-- **安全性**：会话结束后自动恢复原始设置
-- **灵活性**：可以同时运行多个 CCMaster 会话
+- **Isolation**: Each session is independent
+- **Security**: Original settings restored after session ends
+- **Flexibility**: Multiple CCMaster sessions can run simultaneously
 
-### 2. 为什么使用 AppleScript？
+### 2. Why AppleScript?
 
-- macOS 原生支持，无需额外依赖
-- 可以精确控制终端窗口
-- 支持键盘输入模拟
+- Native macOS support, no additional dependencies
+- Precise Terminal window control
+- Supports keyboard input simulation
 
-### 3. 为什么使用轮询而非事件推送？
+### 3. Why Polling Instead of Event Push?
 
-- Claude Code 钩子系统的限制
-- 简化实现，避免复杂的 IPC
-- 0.2秒的轮询间隔足够响应
+- Claude Code hooks system limitations
+- Simplified implementation, avoiding complex IPC
+- 0.2-second polling interval is sufficiently responsive
 
-### 4. 轮次限制的设计考虑
+### 4. Turn Limit Design Considerations
 
-- 防止无限循环消耗资源
-- 给用户明确的控制权
-- 支持手动重置，平衡自动化和控制
+- Prevents infinite loops consuming resources
+- Gives users explicit control
+- Supports manual reset, balancing automation and control
 
-## 🚀 性能优化
+## 🚀 Performance Optimizations
 
-1. **进程检测优化**
-   - 使用 `ps aux` 而非 `pgrep`，更可靠
-   - 添加重试机制，避免误判
-   - 精确过滤，排除自身进程
+1. **Process Detection Optimization**
+   - Uses `ps aux` instead of `pgrep` for reliability
+   - Retry mechanism to avoid false positives
+   - Precise filtering to exclude own process
 
-2. **状态更新优化**
-   - 只在状态变化时更新显示
-   - 使用队列避免显示冲突
-   - 区分显示日志和记录日志
+2. **State Update Optimization**
+   - Updates display only on state changes
+   - Uses queue to avoid display conflicts
+   - Separates display logs from record logs
 
-3. **键盘输入优化**
-   - 非阻塞输入，不影响主循环
-   - 正确保存和恢复终端设置
-   - 使用 select 避免 CPU 占用
+3. **Keyboard Input Optimization**
+   - Non-blocking input doesn't affect main loop
+   - Properly saves and restores terminal settings
+   - Uses select to avoid CPU usage
 
-## 🔒 错误处理
+## 🔒 Error Handling
 
-1. **进程监控错误**
-   - 双重检查避免误报
-   - 继续运行即使找不到 PID
-   - 详细的调试日志
+1. **Process Monitoring Errors**
+   - Double-check to avoid false reports
+   - Continues running even if PID not found
+   - Detailed debug logging
 
-2. **钩子执行错误**
-   - 总是返回有效 JSON
-   - 错误不影响 Claude Code 运行
-   - 静默失败，记录日志
+2. **Hook Execution Errors**
+   - Always returns valid JSON
+   - Errors don't affect Claude Code operation
+   - Silent failures with logging
 
-3. **终端控制错误**
-   - 提供降级方案
-   - 使用 key code 作为备选
-   - 警告但不中断监控
+3. **Terminal Control Errors**
+   - Provides fallback options
+   - Uses key code as alternative
+   - Warns but doesn't interrupt monitoring
 
-## 📝 总结
+## 📝 Summary
 
-CCMaster 通过巧妙利用 Claude Code 的钩子系统，实现了对会话的完整监控和自动化控制。其设计强调：
+CCMaster cleverly leverages Claude Code's hooks system to achieve complete session monitoring and automation control. Its design emphasizes:
 
-- **用户体验**：美观的输出，直观的交互
-- **可靠性**：健壮的错误处理，多重保障
-- **灵活性**：可配置的参数，交互式控制
-- **性能**：优化的轮询，最小的资源占用
+- **User Experience**: Beautiful output, intuitive interaction
+- **Reliability**: Robust error handling, multiple safeguards
+- **Flexibility**: Configurable parameters, interactive controls
+- **Performance**: Optimized polling, minimal resource usage
 
-这种设计使 CCMaster 成为提升 Claude Code 使用体验的强大工具。
+This design makes CCMaster a powerful tool for enhancing the Claude Code experience.

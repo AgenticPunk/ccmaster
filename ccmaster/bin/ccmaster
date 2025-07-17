@@ -57,7 +57,6 @@ class CCMaster:
         else:
             config = {
                 'claude_code_command': 'claude',
-                'default_working_dir': str(Path.home()),
                 'monitor_interval': 0.5
             }
             with open(self.config_file, 'w') as f:
@@ -226,35 +225,53 @@ class CCMaster:
                 pass
     
     def monitor_process(self, session_id, pid):
-        """Monitor Claude process"""
+        """Monitor Claude process - improved with less aggressive ending detection"""
         self.log_event(session_id, 'DEBUG', f'Starting to monitor process {pid}', display=False)
-        check_count = 0
+        consecutive_failures = 0
+        max_failures = 3  # Allow 3 consecutive failures before declaring ended
         
         while True:
             try:
-                check_count += 1
                 # Check if process is still running
                 result = subprocess.run(['ps', '-p', str(pid)], capture_output=True, text=True)
                 
                 if result.returncode != 0:
-                    # Double-check with a more specific search before declaring it ended
-                    verify_result = subprocess.run(['ps', 'aux'], capture_output=True, text=True)
-                    claude_still_running = False
+                    consecutive_failures += 1
+                    self.log_event(session_id, 'DEBUG', f'Process check failed, count: {consecutive_failures}/{max_failures}', display=False)
                     
-                    if verify_result.returncode == 0:
-                        for line in verify_result.stdout.split('\n'):
-                            if str(pid) in line and 'claude' in line:
-                                claude_still_running = True
-                                break
-                    
-                    if not claude_still_running:
-                        self.log_event(session_id, 'SESSION_END', f'Claude session ended (PID {pid} not found after {check_count} checks)')
-                        self.sessions[session_id]['status'] = 'ended'
-                        self.sessions[session_id]['ended_at'] = datetime.now().isoformat()
-                        self.save_sessions()
-                        break
-                    else:
-                        self.log_event(session_id, 'DEBUG', f'False alarm - claude process {pid} still running', display=False)
+                    if consecutive_failures >= max_failures:
+                        # Triple-check with different methods before declaring it ended
+                        verify_methods = [
+                            ['ps', 'aux'],
+                            ['pgrep', '-f', 'claude'],
+                        ]
+                        
+                        claude_still_running = False
+                        for method in verify_methods:
+                            try:
+                                verify_result = subprocess.run(method, capture_output=True, text=True)
+                                if verify_result.returncode == 0:
+                                    for line in verify_result.stdout.split('\n'):
+                                        if str(pid) in line and 'claude' in line:
+                                            claude_still_running = True
+                                            break
+                                    if claude_still_running:
+                                        break
+                            except Exception:
+                                continue
+                        
+                        if not claude_still_running:
+                            self.log_event(session_id, 'SESSION_END', f'Claude session ended (PID {pid} confirmed dead after {consecutive_failures} checks)')
+                            self.sessions[session_id]['status'] = 'ended'
+                            self.sessions[session_id]['ended_at'] = datetime.now().isoformat()
+                            self.save_sessions()
+                            break
+                        else:
+                            self.log_event(session_id, 'DEBUG', f'False alarm - claude process {pid} still running', display=False)
+                            consecutive_failures = 0  # Reset counter
+                else:
+                    # Process found, reset failure counter
+                    consecutive_failures = 0
                 
                 time.sleep(self.config['monitor_interval'])
                 
@@ -262,91 +279,122 @@ class CCMaster:
                 self.log_event(session_id, 'ERROR', f'Process monitoring error: {str(e)}')
                 break
     
-    def find_claude_pid(self, max_attempts=10):
-        """Find the PID of the Claude process with retries"""
-        # Get our own PID to exclude it
-        our_pid = os.getpid()
-        
-        for attempt in range(max_attempts):
-            time.sleep(1)  # Wait a bit between attempts
-            
-            # Use ps to find processes, more reliable than pgrep
-            result = subprocess.run(['ps', 'aux'], capture_output=True, text=True)
-            if result.returncode == 0:
-                lines = result.stdout.strip().split('\n')
-                for line in lines:
-                    # Check if this is a claude process (not ccmaster)
-                    if self.config['claude_code_command'] in line and 'ccmaster' not in line and 'python' not in line:
-                        parts = line.split()
-                        if len(parts) > 1:
-                            try:
-                                pid = int(parts[1])
-                                # Don't return our own PID
-                                if pid != our_pid:
-                                    self.log_event(None, 'DEBUG', f'Found claude process: PID={pid}, line={line[:100]}', display=False)
-                                    return pid
-                            except ValueError:
-                                continue
-            
-            # Continue trying
-            if attempt < max_attempts - 1:
-                self.log_event(None, 'PROCESS', f'Waiting for Claude process to start... ({attempt + 1}/{max_attempts})', display=False)
-        
-        return None
+    def is_claude_running(self):
+        """Simple check if any Claude process is running"""
+        try:
+            result = subprocess.run(['pgrep', '-f', self.config['claude_code_command']], 
+                                  capture_output=True, text=True)
+            return result.returncode == 0 and result.stdout.strip()
+        except Exception:
+            # Fallback to ps method
+            try:
+                result = subprocess.run(['ps', 'aux'], capture_output=True, text=True)
+                if result.returncode == 0:
+                    for line in result.stdout.split('\n'):
+                        if self.config['claude_code_command'] in line and 'ccmaster' not in line:
+                            return True
+            except Exception:
+                pass
+        return False
     
-    def send_prompt_to_terminal(self, window_id, prompt):
-        """Send a prompt to the Claude terminal window"""
-        # Clear any interrupted state first by sending a newline
-        clear_script = f'''
+    def simple_monitor_session(self, session_id):
+        """Simple session monitoring that just checks if Claude is still running"""
+        consecutive_failures = 0
+        max_failures = 5  # Allow 5 consecutive failures (10 seconds) before declaring dead
+        
+        # Wait a bit for Claude to start
+        time.sleep(3)
+        
+        while True:
+            try:
+                if self.is_claude_running():
+                    consecutive_failures = 0
+                    self.log_event(session_id, 'DEBUG', 'Claude process detected', display=False)
+                else:
+                    consecutive_failures += 1
+                    self.log_event(session_id, 'DEBUG', f'Claude not detected, count: {consecutive_failures}/{max_failures}', display=False)
+                    
+                    if consecutive_failures >= max_failures:
+                        print(f"\n[{datetime.now().strftime('%H:%M:%S')}] 💀 Claude session appears to have ended")
+                        self.sessions[session_id]['status'] = 'ended'
+                        self.sessions[session_id]['ended_at'] = datetime.now().isoformat()
+                        self.save_sessions()
+                        self.log_event(session_id, 'SESSION_END', 'Claude session ended (process not found)')
+                        break
+                
+                time.sleep(2)  # Check every 2 seconds
+                
+            except Exception as e:
+                self.log_event(session_id, 'ERROR', f'Monitoring error: {str(e)}')
+                break
+    
+    def send_continue_to_claude(self):
+        """Send 'continue' to Claude using the simplest possible approach"""
+        # Method 1: Find Terminal window running Claude and send continue
+        simple_script = '''
         tell application "Terminal"
             activate
-            set frontmost of window id {window_id} to true
-            delay 0.3
-        end tell
-        
-        tell application "System Events"
-            tell process "Terminal"
-                -- Send a return first to clear any interrupted state
-                keystroke return
-                delay 0.2
-                -- Now type the prompt
-                keystroke "{prompt}"
-                delay 0.1
-                -- Send return to execute
-                keystroke return
-            end tell
+            -- Find the window with Claude running
+            repeat with w in windows
+                repeat with t in tabs of w
+                    try
+                        if (processes of t) contains "claude" then
+                            -- Found Claude tab, make it active and send continue
+                            set frontmost of w to true
+                            set selected of t to true
+                            delay 0.3
+                            
+                            -- Type continue and press return
+                            tell application "System Events"
+                                tell process "Terminal"
+                                    keystroke "continue"
+                                    delay 0.1
+                                    keystroke return
+                                end tell
+                            end tell
+                            return "success"
+                        end if
+                    end try
+                end repeat
+            end repeat
+            return "no_claude_found"
         end tell
         '''
         
         try:
-            result = subprocess.run(['osascript', '-e', clear_script], 
-                                  capture_output=True, text=True)
+            result = subprocess.run(['osascript', '-e', simple_script], 
+                                  capture_output=True, text=True, timeout=10)
             
-            if result.returncode != 0:
-                # Fallback: Try with key code for return instead
-                fallback_script = f'''
-                tell application "Terminal"
-                    activate
-                end tell
-                
-                delay 0.5
-                
-                tell application "System Events"
-                    -- Clear line with return
-                    key code 36
-                    delay 0.2
-                    -- Type prompt
-                    keystroke "{prompt}"
-                    delay 0.1
-                    -- Execute with return
-                    key code 36
-                end tell
-                '''
-                
-                subprocess.run(['osascript', '-e', fallback_script])
+            if result.returncode == 0:
+                output = result.stdout.strip()
+                if output == "success":
+                    return True
+                elif output == "no_claude_found":
+                    print(f"[{datetime.now().strftime('%H:%M:%S')}] {Colors.YELLOW}⚠️  No Claude terminal found for auto-continue{Colors.RESET}")
+                    return False
+            
+            # If that fails, try the even simpler approach
+            fallback_script = '''
+            tell application "System Events"
+                -- Just type in whatever Terminal window is frontmost
+                keystroke "continue"
+                delay 0.1
+                keystroke return
+            end tell
+            '''
+            
+            result2 = subprocess.run(['osascript', '-e', fallback_script],
+                                   capture_output=True, text=True, timeout=5)
+            
+            if result2.returncode == 0:
+                print(f"[{datetime.now().strftime('%H:%M:%S')}] {Colors.BLUE}📝 Sent 'continue' to frontmost terminal{Colors.RESET}")
+                return True
                 
         except Exception as e:
-            print(f"[Warning] Auto-continue may have failed: {e}")
+            print(f"[{datetime.now().strftime('%H:%M:%S')}] {Colors.YELLOW}⚠️  Auto-continue failed: {str(e)}{Colors.RESET}")
+        
+        print(f"[{datetime.now().strftime('%H:%M:%S')}] 💡 Please type 'continue' manually")
+        return False
     
     def format_status_line(self, status):
         """Format status line with color"""
@@ -367,10 +415,11 @@ class CCMaster:
             return sys.stdin.read(1)
         return None
     
-    def start_session_and_monitor(self, working_dir=None, watch_mode=False):
+    def start_session_and_monitor(self, working_dir=None, watch_mode=False, max_turns=None):
         """Start a new Claude Code session and monitor it"""
         session_id = datetime.now().strftime('%Y%m%d_%H%M%S')
-        working_dir = working_dir or self.config['default_working_dir']
+        # Always use current working directory if not specified
+        working_dir = working_dir or os.getcwd()
         
         # Create session entry
         self.sessions[session_id] = {
@@ -385,7 +434,10 @@ class CCMaster:
         print(f"\n🚀 Starting Claude session in {working_dir}")
         print(f"📍 Session ID: {session_id}")
         if watch_mode:
-            print(f"👁️  {Colors.GREEN}Watch mode: ON - Will auto-continue after idle{Colors.RESET}")
+            if max_turns:
+                print(f"👁️  {Colors.GREEN}Watch mode: ON - Will auto-continue after idle (max {max_turns} turns){Colors.RESET}")
+            else:
+                print(f"👁️  {Colors.GREEN}Watch mode: ON - Will auto-continue after idle{Colors.RESET}")
         else:
             print(f"👀 Watch mode: OFF - Press [w] to toggle")
         print()
@@ -399,12 +451,11 @@ class CCMaster:
         # Prepare Claude Code command
         claude_cmd = self.config['claude_code_command']
         
-        # Create AppleScript to open new Terminal window
+        # Simple AppleScript to open Terminal and start Claude
         applescript = f'''
         tell application "Terminal"
             activate
-            set newWindow to do script "cd {working_dir} && {claude_cmd}"
-            return id of window 1
+            do script "cd {working_dir} && {claude_cmd}"
         end tell
         '''
         
@@ -412,33 +463,24 @@ class CCMaster:
         result = subprocess.run(['osascript', '-e', applescript], 
                                 capture_output=True, text=True)
         
-        window_id = None
         if result.returncode == 0:
-            window_id = result.stdout.strip()
-            self.log_event(session_id, 'TERMINAL', f'Opened Terminal window {window_id}', display=False)
+            print(f"[{datetime.now().strftime('%H:%M:%S')}] 🚀 Launched Claude in Terminal")
+            self.log_event(session_id, 'TERMINAL', f'Launched Claude in Terminal', display=False)
+        else:
+            print(f"[{datetime.now().strftime('%H:%M:%S')}] ❌ Failed to launch Claude: {result.stderr}")
+            self.log_event(session_id, 'ERROR', f'Failed to launch Claude: {result.stderr}', display=True)
         
         # Update session status
         self.sessions[session_id]['status'] = 'running'
         self.save_sessions()
         
-        # Find Claude process with retries
-        pid = self.find_claude_pid()
-        if pid:
-            self.sessions[session_id]['pid'] = pid
-            self.save_sessions()
-            self.log_event(session_id, 'PROCESS', f'Claude process started with PID {pid}', display=False)
-            
-            # Start process monitoring thread
-            process_thread = threading.Thread(
-                target=self.monitor_process, 
-                args=(session_id, pid),
-                daemon=True
-            )
-            process_thread.start()
-        else:
-            # Claude process not found after retries
-            self.log_event(session_id, 'WARNING', 'Could not find Claude process PID, continuing without process monitoring', display=True)
-            # Don't mark as ended - let the user decide when to stop
+        # Start simple monitoring thread that checks if Claude is running
+        monitor_thread = threading.Thread(
+            target=self.simple_monitor_session,
+            args=(session_id,),
+            daemon=True
+        )
+        monitor_thread.start()
         
         # Start status monitoring thread
         status_thread = threading.Thread(
@@ -453,7 +495,7 @@ class CCMaster:
         has_seen_first_prompt = False
         auto_continue_pending = False
         continue_countdown = 0
-        terminal_window_id = window_id  # Store window ID for auto-continue
+        auto_continue_count = 0  # Track number of auto-continues
         
         # Set up terminal for non-blocking input
         old_settings = termios.tcgetattr(sys.stdin)
@@ -469,11 +511,31 @@ class CCMaster:
                 # Check for keyboard input
                 key = self.check_keyboard_input()
                 if key == 'w':
+                    was_at_max_turns = max_turns and auto_continue_count >= max_turns
                     watch_mode = not watch_mode
                     timestamp = datetime.now()
                     time_str = timestamp.strftime('%H:%M:%S')
                     if watch_mode:
-                        print(f"[{time_str}] {Colors.GREEN}👁️  Watch mode: ON - Will auto-continue after idle{Colors.RESET}")
+                        # Reset auto-continue count when toggling watch mode on after hitting max
+                        if was_at_max_turns:
+                            auto_continue_count = 0
+                            print(f"[{time_str}] {Colors.GREEN}🔄 Auto-continue count reset{Colors.RESET}")
+                        
+                        if max_turns:
+                            remaining = max_turns - auto_continue_count
+                            print(f"[{time_str}] {Colors.GREEN}👁️  Watch mode: ON - Will auto-continue after idle ({remaining} turns left){Colors.RESET}")
+                        else:
+                            print(f"[{time_str}] {Colors.GREEN}👁️  Watch mode: ON - Will auto-continue after idle{Colors.RESET}")
+                        
+                        # If we're currently idle and re-enabling after max turns, immediately continue
+                        if was_at_max_turns and self.current_status == 'idle':
+                            # Send continue immediately
+                            if self.send_continue_to_claude():
+                                auto_continue_count += 1
+                                if max_turns:
+                                    print(f"[{time_str}] {Colors.GREEN}▶ Auto-continue ({auto_continue_count}/{max_turns}){Colors.RESET}")
+                                else:
+                                    print(f"[{time_str}] {Colors.GREEN}▶ Auto-continue{Colors.RESET}")
                     else:
                         print(f"[{time_str}] 👀 Watch mode: OFF")
                         # Cancel any pending auto-continue
@@ -500,8 +562,14 @@ class CCMaster:
                                 print(f"[{time_str}] {status_display}")
                                 # In watch mode, auto-continue after first prompt
                                 if watch_mode and has_seen_first_prompt:
-                                    auto_continue_pending = True
-                                    continue_countdown = 1
+                                    # Check if we've reached max turns
+                                    if max_turns is None or auto_continue_count < max_turns:
+                                        auto_continue_pending = True
+                                        continue_countdown = 2  # 2 seconds to ensure Claude is really idle
+                                    else:
+                                        print(f"[{time_str}] {Colors.YELLOW}🛑 Max auto-continue turns ({max_turns}) reached - Watch mode disabled{Colors.RESET}")
+                                        print(f"[{time_str}] 💡 Press [w] to re-enable and continue")
+                                        watch_mode = False
                             current_status_display = status_display
                             
                         elif event_type == 'USER':
@@ -530,14 +598,20 @@ class CCMaster:
                     continue_countdown -= 1
                     
                     if continue_countdown == 0:
-                        # Send continue command via AppleScript
-                        self.send_prompt_to_terminal(terminal_window_id, "continue")
-                        auto_continue_pending = False
-                        # Log the auto-continue with special formatting
-                        timestamp = datetime.now()
-                        time_str = timestamp.strftime('%H:%M:%S')
-                        print(f"[{time_str}] {Colors.GREEN}▶ Auto-continue{Colors.RESET}")
-                        # Don't log to queue to avoid duplicate
+                        # Send continue command
+                        if self.send_continue_to_claude():
+                            auto_continue_pending = False
+                            auto_continue_count += 1
+                            # Log the successful auto-continue
+                            timestamp = datetime.now()
+                            time_str = timestamp.strftime('%H:%M:%S')
+                            if max_turns:
+                                print(f"[{time_str}] {Colors.GREEN}▶ Auto-continue ({auto_continue_count}/{max_turns}){Colors.RESET}")
+                            else:
+                                print(f"[{time_str}] {Colors.GREEN}▶ Auto-continue{Colors.RESET}")
+                        else:
+                            # Auto-continue failed, cancel it
+                            auto_continue_pending = False
                 else:
                     time.sleep(0.1)
                 
@@ -617,6 +691,7 @@ def main():
     # Watch command
     watch_parser = subparsers.add_parser('watch', help='Start in watch mode (auto-continue)')
     watch_parser.add_argument('-d', '--dir', help='Working directory', default=None)
+    watch_parser.add_argument('--maxturn', type=int, help='Maximum number of auto-continue turns', default=None)
     
     # List command
     subparsers.add_parser('list', help='List all sessions')
@@ -638,7 +713,7 @@ def main():
         working_dir = args.dir if args.command == 'start' else None
         cc.start_session_and_monitor(working_dir, watch_mode=False)
     elif args.command == 'watch':
-        cc.start_session_and_monitor(args.dir, watch_mode=True)
+        cc.start_session_and_monitor(args.dir, watch_mode=True, max_turns=args.maxturn)
     elif args.command == 'list':
         cc.list_sessions()
     elif args.command == 'logs':
