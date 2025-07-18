@@ -13,6 +13,7 @@ CCMaster is an intelligent session management tool for Claude Code. It automatic
 - 🎨 **Beautiful Output**: Color-coded status indicators for easy reading
 - ⌨️ **Interactive Controls**: Press [w] to toggle watch mode during any session
 - 🔢 **Turn Limiting**: Set maximum auto-continue turns with --maxturn
+- 🤝 **Multi-Agent Support**: Manage multiple Claude sessions simultaneously with --instances
 
 ## 🛠 Installation
 
@@ -56,6 +57,12 @@ ccmaster watch -d /path/to/project
 # Start in watch mode with maximum 100 auto-continues
 ccmaster watch --maxturn 100
 
+# Start 2 Claude sessions in watch mode (multi-agent)
+ccmaster watch --instances 2
+
+# Start 3 Claude sessions with max 50 auto-continues each
+ccmaster watch --instances 3 --maxturn 50
+
 # List all sessions
 ccmaster list
 
@@ -88,6 +95,41 @@ When the turn limit is reached:
 - Watch mode automatically turns off
 - Press [w] to reset the counter and resume auto-continuing
 - If Claude is idle, it will immediately send a continue command
+
+### Multi-Agent Mode
+
+When running with `--instances`, CCMaster provides a unified view of all sessions:
+
+```bash
+# Launch 3 Claude sessions
+ccmaster watch --instances 3
+```
+
+Output example:
+```
+🚀 Starting 3 Claude sessions in /Users/yourname/project
+👁️  Watch mode: ON - Will auto-continue after idle
+
+[1] 📍 Session ID: 20240124_143022
+[2] 📍 Session ID: 20240124_143023
+[3] 📍 Session ID: 20240124_143024
+
+[1][14:30:22] 🚀 Launched Claude in Terminal (Window: 4211, Tab: 2)
+[2][14:30:23] 🚀 Launched Claude in Terminal (Window: 4211, Tab: 3)
+[3][14:30:24] 🚀 Launched Claude in Terminal (Window: 4211, Tab: 4)
+
+🎯 All sessions launched. Monitoring...
+Press [q] to quit, [w] to toggle watch mode for all sessions
+
+[1][14:30:25] ● Processing
+[2][14:30:25] ● Idle
+[3][14:30:25] ● Processing
+[1][14:30:26] ▶ User: "Create API endpoints"
+[3][14:30:26] ▶ User: "Write tests"
+[2][14:30:27] ▶ Auto-continue (1/∞)
+[1][14:30:28] ● Working
+[1][14:30:28] → Using Write
+```
 
 ### Example Output
 
@@ -123,6 +165,28 @@ CCMaster uses a hooks-based architecture to monitor Claude Code:
        └──────────────────────────────────────────┘
                     Status Updates
 ```
+
+### Multi-Agent Architecture
+
+With `--instances`, CCMaster can manage multiple Claude sessions:
+
+```
+┌─────────────┐     ┌──────────────┐     ┌─────────────┐
+│   CCMaster  │────▶│ Claude Code 1│────▶│   Hooks 1   │
+│   Monitor   │     └──────────────┘     └─────────────┘
+│             │     ┌──────────────┐     ┌─────────────┐
+│             │────▶│ Claude Code 2│────▶│   Hooks 2   │
+│             │     └──────────────┘     └─────────────┘
+│             │     ┌──────────────┐     ┌─────────────┐
+│             │────▶│ Claude Code N│────▶│   Hooks N   │
+└─────────────┘     └──────────────┘     └─────────────┘
+```
+
+Each session:
+- Has its own Terminal window/tab
+- Maintains independent status tracking
+- Has isolated hook configurations
+- Can be auto-continued individually
 
 ### Key Components
 

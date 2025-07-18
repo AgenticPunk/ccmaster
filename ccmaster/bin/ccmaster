@@ -53,8 +53,16 @@ class CCMaster:
         self.message_queue = queue.Queue()
         self.should_stop = False
         
-        # Current status for the session
-        self.current_status = 'idle'
+        # Current status for the session - now a dict for multi-agent
+        self.current_status = {}
+        
+        # Multi-agent support
+        self.active_sessions = {}  # session_id -> session data
+        self.session_threads = {}  # session_id -> threads
+        self.watch_modes = {}  # session_id -> bool
+        self.auto_continue_counts = {}  # session_id -> count
+        self.max_turns = {}  # session_id -> max_turns
+        self.has_seen_first_prompt = {}  # session_id -> bool
     
     def load_config(self):
         """Load or create default configuration"""
@@ -84,7 +92,8 @@ class CCMaster:
     
     def create_session(self, working_dir):
         """Create a new session"""
-        session_id = datetime.now().strftime('%Y%m%d_%H%M%S')
+        # Add microseconds to ensure unique IDs when creating multiple sessions quickly
+        session_id = datetime.now().strftime('%Y%m%d_%H%M%S_%f')[:21]  # Trim to reasonable length
         session = {
             'id': session_id,
             'started_at': datetime.now().isoformat(),
@@ -112,7 +121,8 @@ class CCMaster:
             f.write(json.dumps(log_entry) + '\n')
         
         if display and not self.should_stop:
-            self.message_queue.put(('LOG', timestamp, event_type, message))
+            # For multi-agent compatibility, include session_id
+            self.message_queue.put((session_id, 'LOG', timestamp, event_type, message))
     
     def create_hooks_config(self, session_id):
         """Create per-session hooks configuration"""
@@ -637,6 +647,10 @@ class CCMaster:
         continue_countdown = 0
         auto_continue_count = 0
         
+        # Initialize current_status for this session
+        if isinstance(self.current_status, dict):
+            self.current_status[session_id] = 'idle'
+        
         # Set up terminal for keyboard input
         old_settings = termios.tcgetattr(sys.stdin)
         
@@ -670,7 +684,8 @@ class CCMaster:
                             self.safe_print(f"[{time_str}] {Colors.GREEN}👁️  Watch mode: ON - Will auto-continue after idle{Colors.RESET}", old_settings)
                         
                         # If we're currently idle and re-enabling after max turns, immediately continue
-                        if was_at_max_turns and self.current_status == 'idle':
+                        current_session_status = self.current_status[session_id] if isinstance(self.current_status, dict) else self.current_status
+                        if was_at_max_turns and current_session_status == 'idle':
                             # Send continue immediately
                             if self.send_continue_to_claude(session_id):
                                 auto_continue_count += 1
@@ -687,7 +702,8 @@ class CCMaster:
                 # Process messages from queue
                 try:
                     while True:
-                        msg_type, timestamp, event_type, message = self.message_queue.get_nowait()
+                        # Get 5-tuple message (session_id, msg_type, timestamp, event_type, message)
+                        session_id_from_msg, msg_type, timestamp, event_type, message = self.message_queue.get_nowait()
                         time_str = timestamp.strftime('%H:%M:%S')
                         
                         if msg_type == 'STATUS':
@@ -820,7 +836,11 @@ class CCMaster:
                             if current_update != last_update:
                                 last_update = current_update
                                 state = status_data.get('state', 'idle')
-                                self.current_status = state
+                                # For multi-agent compatibility, use dictionary
+                                if isinstance(self.current_status, dict):
+                                    self.current_status[session_id] = state
+                                else:
+                                    self.current_status = state
                                 
                                 # Format and queue the status message
                                 if state == 'working':
@@ -833,12 +853,14 @@ class CCMaster:
                                 else:
                                     message = "Idle"
                                 
-                                self.message_queue.put(('STATUS', datetime.now(), 'STATUS', message))
+                                # For multi-agent compatibility, always include session_id
+                                self.message_queue.put((session_id, 'STATUS', datetime.now(), 'STATUS', message))
                                 
                                 # Check for user prompts
                                 if state == 'processing' and 'prompt' in status_data:
                                     prompt = status_data['prompt']
-                                    self.message_queue.put(('USER', datetime.now(), 'USER', prompt))
+                                    # For multi-agent compatibility
+                                    self.message_queue.put((session_id, 'USER', datetime.now(), 'USER', prompt))
                                     
                                     # Log the prompt to the prompts file
                                     prompt_log_file = self.logs_dir / f"{session_id}_prompts.log"
@@ -934,6 +956,270 @@ class CCMaster:
                 except json.JSONDecodeError:
                     print(line.strip())
 
+    def start_multi_session_and_monitor(self, working_dir=None, watch_mode=False, max_turns=None, num_instances=2):
+        """Start multiple Claude sessions and monitor them concurrently"""
+        # Always use current directory if not specified
+        if working_dir is None:
+            working_dir = os.getcwd()
+        else:
+            working_dir = os.path.abspath(working_dir)
+        
+        print(f"🚀 Starting {num_instances} Claude sessions in {working_dir}")
+        if watch_mode:
+            if max_turns:
+                print(f"👁️  {Colors.GREEN}Watch mode: ON - Will auto-continue after idle (max {max_turns} turns per session){Colors.RESET}")
+            else:
+                print(f"👁️  {Colors.GREEN}Watch mode: ON - Will auto-continue after idle{Colors.RESET}")
+        else:
+            print(f"👀 Watch mode: OFF - Press [w] to toggle for all sessions")
+        print()
+        
+        # Create all sessions
+        session_ids = []
+        for i in range(num_instances):
+            session_id = self.create_session(working_dir)
+            session_ids.append(session_id)
+            self.active_sessions[session_id] = {
+                'index': i + 1,
+                'working_dir': working_dir,
+                'status': 'starting'
+            }
+            self.current_status[session_id] = 'idle'
+            self.watch_modes[session_id] = watch_mode
+            self.auto_continue_counts[session_id] = 0
+            self.max_turns[session_id] = max_turns
+            self.has_seen_first_prompt[session_id] = False
+            
+            print(f"[{i+1}] 📍 Session ID: {session_id}")
+            self.log_event(session_id, 'SESSION_START', f'Starting session {i+1} of {num_instances} in {working_dir}', display=False)
+        
+        print()
+        
+        # Launch all sessions with slight delay between each
+        for i, session_id in enumerate(session_ids):
+            # Create per-session hooks configuration
+            settings_file, backup_file = self.create_hooks_config(session_id)
+            self.log_event(session_id, 'HOOKS', f'Created hooks configuration for session', display=False)
+            
+            # Prepare Claude Code command
+            claude_cmd = self.config['claude_code_command'] + ' --dangerously-skip-permissions'
+            
+            # AppleScript to open Terminal and start Claude
+            applescript = f'''
+            tell application "Terminal"
+                activate
+                set newTab to do script "cd {working_dir} && {claude_cmd}"
+                set windowId to id of window 1
+                set tabIndex to 1
+                repeat with t in tabs of window 1
+                    if t is newTab then
+                        exit repeat
+                    end if
+                    set tabIndex to tabIndex + 1
+                end repeat
+                return "" & windowId & "," & tabIndex
+            end tell
+            '''
+            
+            # Execute AppleScript
+            launch_time = time.time()
+            result = subprocess.run(['osascript', '-e', applescript], 
+                                    capture_output=True, text=True)
+            
+            if result.returncode == 0:
+                # Parse window and tab info
+                try:
+                    window_tab_info = result.stdout.strip()
+                    if ',' in window_tab_info:
+                        window_id, tab_index = window_tab_info.split(',')
+                        self.sessions[session_id]['terminal_window_id'] = int(window_id)
+                        self.sessions[session_id]['terminal_tab_index'] = int(tab_index)
+                        self.active_sessions[session_id]['terminal_window_id'] = int(window_id)
+                        self.active_sessions[session_id]['terminal_tab_index'] = int(tab_index)
+                        print(f"[{i+1}][{datetime.now().strftime('%H:%M:%S')}] 🚀 Launched Claude in Terminal (Window: {window_id}, Tab: {tab_index})")
+                except Exception as e:
+                    print(f"[{i+1}][{datetime.now().strftime('%H:%M:%S')}] 🚀 Launched Claude in Terminal")
+            else:
+                print(f"[{i+1}][{datetime.now().strftime('%H:%M:%S')}] ❌ Failed to launch Claude: {result.stderr}")
+            
+            # Update session status
+            self.sessions[session_id]['status'] = 'running'
+            self.active_sessions[session_id]['status'] = 'running'
+            self.save_sessions()
+            
+            # Start monitoring threads for this session
+            monitor_thread = threading.Thread(
+                target=self.simple_monitor_session,
+                args=(session_id, launch_time),
+                daemon=True
+            )
+            monitor_thread.start()
+            self.session_threads[session_id] = {'monitor': monitor_thread}
+            
+            status_thread = threading.Thread(
+                target=self.monitor_status,
+                args=(session_id,),
+                daemon=True
+            )
+            status_thread.start()
+            self.session_threads[session_id]['status'] = status_thread
+            
+            # Small delay between launching sessions
+            if i < num_instances - 1:
+                time.sleep(1)
+        
+        print("\n🎯 All sessions launched. Monitoring...")
+        print("Press [q] to quit, [w] to toggle watch mode for all sessions\n")
+        
+        # Message printer thread for multi-agent
+        printer_thread = threading.Thread(
+            target=self.multi_session_message_printer,
+            daemon=True
+        )
+        printer_thread.start()
+        
+        # Set up terminal for keyboard input
+        old_settings = termios.tcgetattr(sys.stdin)
+        
+        try:
+            # Configure terminal for non-blocking input
+            tty.setraw(sys.stdin.fileno())
+            
+            # Main monitoring loop
+            while not self.should_stop:
+                # Check for keyboard input
+                key = self.check_keyboard_input()
+                if key == 'q':
+                    self.safe_print(f"\n[{datetime.now().strftime('%H:%M:%S')}] 🛑 Stopping all session monitors...", old_settings)
+                    self.should_stop = True
+                    break
+                elif key == 'w':
+                    # Toggle watch mode for all sessions
+                    new_watch_mode = not any(self.watch_modes.values())
+                    for sid in self.active_sessions:
+                        self.watch_modes[sid] = new_watch_mode
+                        if new_watch_mode and self.max_turns[sid] and self.auto_continue_counts[sid] >= self.max_turns[sid]:
+                            self.auto_continue_counts[sid] = 0
+                    
+                    time_str = datetime.now().strftime('%H:%M:%S')
+                    if new_watch_mode:
+                        self.safe_print(f"\n[{time_str}] {Colors.GREEN}👁️  Watch mode: ON for all sessions{Colors.RESET}", old_settings)
+                    else:
+                        self.safe_print(f"\n[{time_str}] 👀 Watch mode: OFF for all sessions", old_settings)
+                
+                # Check session statuses and handle auto-continue
+                for session_id in list(self.active_sessions.keys()):
+                    if session_id not in self.current_status:
+                        continue
+                        
+                    # Check if terminal window is still open
+                    if not self.is_terminal_window_open(session_id):
+                        idx = self.active_sessions[session_id]['index']
+                        self.message_queue.put((session_id, 'SESSION_END', datetime.now(), 'SESSION_END', f'Terminal window closed'))
+                        del self.active_sessions[session_id]
+                        continue
+                    
+                    # Handle auto-continue for idle sessions (only after first prompt)
+                    if (self.watch_modes.get(session_id, False) and 
+                        self.current_status.get(session_id) == 'idle' and
+                        self.has_seen_first_prompt.get(session_id, False) and
+                        session_id in self.active_sessions):
+                        
+                        max_t = self.max_turns.get(session_id)
+                        count = self.auto_continue_counts.get(session_id, 0)
+                        
+                        if max_t is None or count < max_t:
+                            # Send continue to this specific session
+                            if self.send_continue_to_claude(session_id):
+                                self.auto_continue_counts[session_id] = count + 1
+                                idx = self.active_sessions[session_id]['index']
+                                self.message_queue.put((session_id, 'AUTO_CONTINUE', datetime.now(), 'AUTO_CONTINUE', 
+                                                      f'Auto-continue ({count + 1}/{max_t if max_t else "∞"})'))
+                
+                # Small sleep to prevent busy-waiting
+                time.sleep(2)
+                
+        except KeyboardInterrupt:
+            print(f"\n[{datetime.now().strftime('%H:%M:%S')}] 🛑 Sessions interrupted by user")
+        finally:
+            # Restore terminal settings
+            termios.tcsetattr(sys.stdin, termios.TCSADRAIN, old_settings)
+            print("\n🛑 All sessions ended.")
+            
+            # Update session statuses
+            for session_id in session_ids:
+                if session_id in self.sessions:
+                    self.sessions[session_id]['status'] = 'ended'
+                    self.sessions[session_id]['ended_at'] = datetime.now().isoformat()
+                self.save_sessions()
+                
+                # Restore original hooks configuration
+                self.restore_hooks_config(session_id)
+    
+    def multi_session_message_printer(self):
+        """Print messages for multiple concurrent sessions"""
+        last_messages = {}
+        
+        while not self.should_stop:
+            try:
+                session_id, event_type, timestamp, _, message = self.message_queue.get(timeout=0.1)
+                
+                if session_id not in self.active_sessions:
+                    continue
+                    
+                idx = self.active_sessions[session_id]['index']
+                time_str = timestamp.strftime('%H:%M:%S')
+                prefix = f"[{idx}]"
+                
+                # Format message based on type
+                if event_type == 'STATUS':
+                    # Extract status from message
+                    if 'Working' in message:
+                        status = 'working'
+                        tool = message.split('tool:')[1].strip() if 'tool:' in message else None
+                    elif 'Processing' in message:
+                        status = 'processing'
+                        tool = None
+                    elif 'Thinking' in message:
+                        status = 'thinking'
+                        tool = None
+                    else:
+                        status = 'idle'
+                        tool = None
+                    
+                    self.current_status[session_id] = status
+                    
+                    # Format status line
+                    status_line = self.format_status_line(status)
+                    print(f"\r{prefix}[{time_str}] {status_line}" + " " * 50)
+                    
+                    if tool:
+                        print(f"{prefix}[{time_str}] → Using {tool}")
+                        
+                elif event_type == 'USER':
+                    prompt_preview = message[:50] + '...' if len(message) > 50 else message
+                    prompt_preview = prompt_preview.replace('\n', ' ')
+                    print(f"\r{prefix}[{time_str}] ▶ User: \"{prompt_preview}\"")
+                    # Mark that this session has seen its first prompt
+                    self.has_seen_first_prompt[session_id] = True
+                    
+                elif event_type == 'AUTO_CONTINUE':
+                    print(f"\r{prefix}[{time_str}] {Colors.GREEN}▶ {message}{Colors.RESET}")
+                    
+                elif event_type == 'SESSION_END':
+                    print(f"\r{prefix}[{time_str}] {Colors.RED}💀 {message}{Colors.RESET}")
+                    
+                else:
+                    print(f"\r{prefix}[{time_str}] {message}")
+                
+                sys.stdout.flush()
+                
+            except queue.Empty:
+                continue
+            except Exception as e:
+                if not self.should_stop:
+                    print(f"\nError in multi-session printer: {e}")
+
 def main():
     parser = argparse.ArgumentParser(description='CCMaster - Claude Code Session Manager')
     
@@ -947,6 +1233,7 @@ def main():
     watch_parser = subparsers.add_parser('watch', help='Start in watch mode (auto-continue)')
     watch_parser.add_argument('-d', '--dir', help='Working directory (defaults to current directory)')
     watch_parser.add_argument('--maxturn', type=int, help='Maximum number of auto-continue turns')
+    watch_parser.add_argument('--instances', type=int, default=1, help='Number of Claude sessions to manage (default: 1)')
     
     # List command
     list_parser = subparsers.add_parser('list', help='List all sessions')
@@ -971,7 +1258,10 @@ def main():
     if args.command == 'start':
         cc.start_session_and_monitor(args.dir if hasattr(args, 'dir') else None)
     elif args.command == 'watch':
-        cc.start_session_and_monitor(args.dir, watch_mode=True, max_turns=args.maxturn)
+        if args.instances > 1:
+            cc.start_multi_session_and_monitor(args.dir, watch_mode=True, max_turns=args.maxturn, num_instances=args.instances)
+        else:
+            cc.start_session_and_monitor(args.dir, watch_mode=True, max_turns=args.maxturn)
     elif args.command == 'list':
         cc.list_sessions()
     elif args.command == 'logs':
