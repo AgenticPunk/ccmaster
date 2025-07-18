@@ -11,8 +11,10 @@ sys.path.append(str(Path(__file__).parent))
 from hook_utils import HookUtils
 
 def main():
+    # Always allow even if no session ID
     if len(sys.argv) < 2:
-        sys.exit(1)
+        print(json.dumps({"allow": True}))
+        sys.exit(0)
     
     session_id = sys.argv[1]
     
@@ -29,4 +31,13 @@ def main():
     print(json.dumps({"allow": True}))
 
 if __name__ == '__main__':
-    main()
+    try:
+        main()
+    except Exception as e:
+        # On any error, allow the operation to continue
+        from datetime import datetime
+        error_log = Path.home() / '.ccmaster' / 'hook_errors.log'
+        with open(error_log, 'a') as f:
+            f.write(f"\n[{datetime.now()}] Stop Hook Error: {str(e)}\n")
+        print(json.dumps({"allow": True}))
+        sys.exit(0)

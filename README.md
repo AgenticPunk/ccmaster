@@ -139,7 +139,9 @@ CCMaster uses a hooks-based architecture to monitor Claude Code:
    - Each session gets its own isolated hook configuration
 
 3. **Monitoring System**
-   - Simple process detection (no complex PID tracking)
+   - Session-specific process tracking with PID detection
+   - Terminal window monitoring - detects when window is closed
+   - Tracks Terminal window and tab for accurate auto-continue
    - Tolerant session monitoring (5 failures before declaring ended)
    - Real-time status files in `~/.ccmaster/status/`
    - Session logs in `~/.ccmaster/logs/`
@@ -162,6 +164,8 @@ Configuration file location: `~/.ccmaster/config.json`
 }
 ```
 
+Note: CCMaster automatically adds the `--dangerously-skip-permissions` flag to all Claude commands to skip permission prompts.
+
 Note: CCMaster always uses the current working directory by default when starting a session.
 
 ## 📁 File Structure
@@ -178,6 +182,11 @@ Note: CCMaster always uses the current working directory by default when startin
 ```
 
 ## 🐛 Troubleshooting
+
+### "Found invalid settings files" warning in Claude
+This can happen if the settings.json format is incorrect. CCMaster now uses the correct hooks format.
+- Run `rm ~/.claude/settings.json` to clear invalid settings
+- CCMaster will create proper settings when starting a new session
 
 ### Session ends immediately
 This is now much more reliable with the simplified approach:

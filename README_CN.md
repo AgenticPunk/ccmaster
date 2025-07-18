@@ -139,7 +139,9 @@ CCMaster 使用基于钩子的架构来监控 Claude Code：
    - 每个会话都有独立的钩子配置
 
 3. **监控系统**
-   - 简单的进程检测（无复杂的 PID 跟踪）
+   - 会话特定的进程跟踪与 PID 检测
+   - 终端窗口监控 - 检测窗口关闭
+   - 跟踪终端窗口和标签页以实现精确的自动续写
    - 容错的会话监控（5 次失败后才声明结束）
    - 实时状态文件位于 `~/.ccmaster/status/`
    - 会话日志位于 `~/.ccmaster/logs/`
@@ -162,6 +164,8 @@ CCMaster 使用基于钩子的架构来监控 Claude Code：
 }
 ```
 
+注意：CCMaster 会自动为所有 Claude 命令添加 `--dangerously-skip-permissions` 标志以跳过权限提示。
+
 注意：CCMaster 默认始终使用当前工作目录来启动会话。
 
 ## 📁 文件结构
@@ -178,6 +182,11 @@ CCMaster 使用基于钩子的架构来监控 Claude Code：
 ```
 
 ## 🐛 故障排除
+
+### Claude 中出现"Found invalid settings files"警告
+这可能是因为 settings.json 格式不正确。CCMaster 现在使用正确的钩子格式。
+- 运行 `rm ~/.claude/settings.json` 清除无效设置
+- CCMaster 在启动新会话时会创建正确的设置
 
 ### 会话立即结束
 现在通过简化的方法更加可靠：
