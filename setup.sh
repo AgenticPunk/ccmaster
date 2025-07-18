@@ -67,6 +67,16 @@ except Exception as e:
     fi
 fi
 
+# Check for Python dependencies
+echo "Checking Python dependencies..."
+python3 -c "import requests" 2>/dev/null
+if [ $? -ne 0 ]; then
+    echo "⚠️  Warning: 'requests' module not found"
+    echo "   MCP integration requires the requests module."
+    echo "   Install with: pip3 install requests"
+    echo ""
+fi
+
 echo "CCMaster v${VERSION} setup complete!"
 echo ""
 echo "Usage:"
@@ -78,4 +88,15 @@ echo "  ccmaster watch --instances 2 - Start multiple Claude sessions"
 echo "  ccmaster list                - List all sessions"
 echo "  ccmaster logs SESSION        - View session logs"
 echo "  ccmaster prompts SESSION     - View user prompts"
+echo "  ccmaster mcp status          - Check MCP server status"
+echo "  ccmaster mcp remove          - Remove CCMaster from project .mcp.json"
 echo "  ccmaster version             - Show version information"
+echo ""
+echo "MCP Integration:"
+echo "  When you run 'ccmaster watch', it will automatically:"
+echo "  1. Find an available port (8080-8090) and start MCP server"
+echo "  2. Create .mcp.json in your project directory with the correct port"
+echo "  3. Claude Code will detect it and enable MCP tools"
+echo "  4. Use tools like: /mcp__ccmaster__list_sessions"
+echo ""
+echo "Note: MCP server uses dynamic port allocation to avoid conflicts"

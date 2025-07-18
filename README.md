@@ -14,6 +14,7 @@ CCMaster is an intelligent session management tool for Claude Code. It automatic
 - ⌨️ **Interactive Controls**: Press [w] to toggle watch mode during any session
 - 🔢 **Turn Limiting**: Set maximum auto-continue turns with --maxturn
 - 🤝 **Multi-Agent Support**: Manage multiple Claude sessions simultaneously with --instances
+- 🔗 **MCP Integration**: Automatic Model Context Protocol support for inter-session communication
 
 ## 🛠 Installation
 
@@ -71,6 +72,12 @@ ccmaster logs 20240124_143022
 
 # View user prompts for a session
 ccmaster prompts 20240124_143022
+
+# Check MCP server status
+ccmaster mcp status
+
+# Remove CCMaster from project .mcp.json
+ccmaster mcp remove
 ```
 
 ### Interactive Controls
@@ -224,13 +231,53 @@ Configuration file location: `~/.ccmaster/config.json`
 ```json
 {
   "claude_code_command": "claude",
-  "monitor_interval": 0.5
+  "monitor_interval": 0.5,
+  "mcp": {
+    "enabled": true,
+    "host": "localhost",
+    "port_range": [8080, 8090]
+  }
 }
 ```
 
 Note: CCMaster automatically adds the `--dangerously-skip-permissions` flag to all Claude commands to skip permission prompts.
 
 Note: CCMaster always uses the current working directory by default when starting a session.
+
+## 🔗 MCP Integration
+
+CCMaster includes automatic Model Context Protocol (MCP) support, enabling intelligent inter-session communication:
+
+### Automatic Setup
+When you run `ccmaster watch`, it automatically:
+1. Finds an available port (8080-8090) and starts MCP server
+2. Creates `.mcp.json` in your project directory with the correct port
+3. Claude Code detects it and enables MCP tools
+
+### Available MCP Tools
+In Claude Code, you can use these tools:
+- `/mcp__ccmaster__list_sessions` - List all active sessions
+- `/mcp__ccmaster__send_message_to_session` - Send messages between sessions
+- `/mcp__ccmaster__create_session` - Create new sessions programmatically
+- `/mcp__ccmaster__kill_session` - Terminate sessions
+- `/mcp__ccmaster__spawn_temp_session` - Run temporary sessions
+- `/mcp__ccmaster__coordinate_sessions` - Coordinate multi-agent tasks
+- `/mcp__ccmaster__get_session_logs` - Access session logs
+- `/mcp__ccmaster__get_session_status` - Check session status
+
+### Example Usage
+```bash
+# In Claude Code, after running ccmaster watch:
+/mcp__ccmaster__list_sessions
+
+# Send a message to another session
+/mcp__ccmaster__send_message_to_session session_id="20250119_123456" message="Please implement the user API"
+
+# Coordinate multiple sessions
+/mcp__ccmaster__coordinate_sessions task_description="Build full-stack app" session_assignments='{"frontend_session": "Build React UI", "backend_session": "Create API endpoints"}'
+```
+
+For detailed MCP documentation, see [MCP_SESSION_INTEGRATION.md](MCP_SESSION_INTEGRATION.md)
 
 ## 📁 File Structure
 

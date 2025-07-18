@@ -23,6 +23,24 @@ import termios
 from datetime import datetime
 from pathlib import Path
 import shlex
+import logging
+
+# Import MCP module
+# Handle both symlinked and direct execution
+script_path = os.path.abspath(__file__)
+if os.path.islink(script_path):
+    # Follow the symlink to get the real path
+    script_path = os.path.realpath(script_path)
+
+# Get the ccmaster root directory (2 levels up from bin/ccmaster)
+ccmaster_root = os.path.dirname(os.path.dirname(os.path.dirname(script_path)))
+sys.path.insert(0, ccmaster_root)
+
+try:
+    from mcp.server import MCPServer
+except ImportError:
+    # MCP module warning will be handled by CCMaster instance
+    MCPServer = None
 
 # ANSI color codes
 class Colors:
@@ -31,6 +49,7 @@ class Colors:
     YELLOW = '\033[93m'
     BLUE = '\033[94m'
     PURPLE = '\033[95m'
+    ORANGE = '\033[38;5;208m'  # Orange color
     RESET = '\033[0m'
     BOLD = '\033[1m'
 
@@ -70,6 +89,28 @@ class CCMaster:
         
         # Thread-safe printing
         self.print_lock = threading.Lock()
+        
+        # MCP Server
+        self.mcp_server = None
+        self.mcp_enabled = self.config.get('mcp', {}).get('enabled', True)
+        self.mcp_port = None  # Will be dynamically allocated
+        self.mcp_host = self.config.get('mcp', {}).get('host', 'localhost')
+        self.mcp_base_port = self.config.get('mcp', {}).get('port', 8181)
+        
+        # Setup logging - redirect to file only to avoid console spam
+        self.logger = logging.getLogger('CCMaster')
+        self.logger.setLevel(logging.INFO)
+        self.logger.handlers = []  # Clear any existing handlers
+        
+        # Add file handler only
+        log_file = self.logs_dir / 'ccmaster.log'
+        file_handler = logging.FileHandler(log_file)
+        file_handler.setFormatter(logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s'))
+        self.logger.addHandler(file_handler)
+        self.logger.propagate = False  # Don't propagate to root logger
+        
+        # MCP port tracking
+        self.mcp_port_file = self.config_dir / 'mcp_port.json'
     
     def load_config(self):
         """Load or create default configuration"""
@@ -79,7 +120,14 @@ class CCMaster:
         else:
             default_config = {
                 'claude_code_command': 'claude',
-                'monitor_interval': 0.5
+                'monitor_interval': 0.5,
+                'mcp': {
+                    'enabled': True,
+                    'host': 'localhost',
+                    'port': 8181,
+                    'port_range': [8181, 8181],
+                    'ensure_mcp_add': True
+                }
             }
             with open(self.config_file, 'w') as f:
                 json.dump(default_config, f, indent=2)
@@ -97,6 +145,303 @@ class CCMaster:
         with open(self.sessions_file, 'w') as f:
             json.dump(self.sessions, f, indent=2)
     
+    def find_available_port(self):
+        """Find an available port starting from the configured port"""
+        import socket
+        
+        # Start with the configured port
+        base_port = self.config.get('mcp', {}).get('port', 8181)
+        max_attempts = 10  # Try up to 10 ports
+        
+        for offset in range(max_attempts):
+            port = base_port + offset
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                try:
+                    s.bind((self.mcp_host, port))
+                    s.close()
+                    if port != base_port:
+                        self.cli_log(f"Port {base_port} was busy, using {port} instead", log_type='info')
+                    return port
+                except OSError:
+                    continue
+        
+        return None
+    
+    def save_mcp_port(self, port):
+        """Save the current MCP port for future sessions"""
+        try:
+            port_data = {'last_port': port, 'timestamp': time.time()}
+            with open(self.mcp_port_file, 'w') as f:
+                json.dump(port_data, f)
+        except Exception as e:
+            self.logger.warning(f"Failed to save MCP port: {e}")
+    
+    def init_mcp_server(self):
+        """Initialize MCP server with static port"""
+        if not self.mcp_enabled:
+            return
+            
+        # Check if MCP module is available
+        if MCPServer is None:
+            self.logger.warning("MCP module not available")
+            self.cli_log("Warning: MCP module not found. MCP features will be disabled.", log_type='warning')
+            self.cli_log(f"  Looked in: {os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))}", log_type='info')
+            self.mcp_enabled = False
+            return
+            
+        # Check if requests module is available (required for stdio_server.py)
+        try:
+            import requests
+        except ImportError:
+            self.logger.error("requests module not found - required for MCP")
+            self.cli_log("MCP requires the 'requests' module. Install with: pip install requests", log_type='warning')
+            self.mcp_enabled = False
+            return
+            
+        # Check if port is available
+        self.mcp_port = self.find_available_port()
+        
+        if not self.mcp_port:
+            base_port = self.config.get('mcp', {}).get('port', 8181)
+            self.logger.error(f"No available ports found starting from {base_port}")
+            self.cli_log(f"No available MCP ports found (tried {base_port} to {base_port + 9})", log_type='warning')
+            self.cli_log("Check if other processes are using these ports", log_type='info')
+            self.cli_log("You can change the base port in ~/.ccmaster/config.json", log_type='info')
+            self.mcp_enabled = False
+            return
+        
+        try:
+            self.mcp_server = MCPServer(self, self.mcp_host, self.mcp_port)
+            if self.mcp_server.start():
+                self.save_mcp_port(self.mcp_port)
+                self.logger.info(f"MCP server started on {self.mcp_host}:{self.mcp_port}")
+                self.cli_log(f"MCP server started on {self.mcp_host}:{self.mcp_port}", log_type='launch', color=Colors.GREEN)
+            else:
+                self.logger.error(f"Failed to start MCP server on port {self.mcp_port}")
+                self.cli_log(f"Failed to start MCP server on port {self.mcp_port}", log_type='warning')
+                self.cli_log("Check ~/.ccmaster/logs/ for details", log_type='info')
+                self.mcp_enabled = False
+        except Exception as e:
+            self.logger.error(f"MCP server initialization error: {e}")
+            self.cli_log(f"MCP server error: {e}", log_type='warning')
+            import traceback
+            self.logger.error(traceback.format_exc())
+            self.mcp_enabled = False
+    
+    def stop_mcp_server(self):
+        """Stop MCP server"""
+        if self.mcp_server:
+            self.mcp_server.stop()
+            self.logger.info("MCP server stopped")
+    
+    def create_project_mcp_config(self, working_dir):
+        """Add CCMaster MCP server to Claude Code using 'claude mcp add' command"""
+        if not self.mcp_enabled or not self.mcp_port:
+            self.logger.warning("MCP not enabled or no port allocated")
+            return
+            
+        # Get the real path to handle symlinks
+        script_path = os.path.abspath(__file__)
+        if os.path.islink(script_path):
+            script_path = os.path.realpath(script_path)
+        
+        # Get the ccmaster root directory (2 levels up from bin/ccmaster)
+        ccmaster_root = os.path.dirname(os.path.dirname(os.path.dirname(script_path)))
+        stdio_server_path = os.path.join(ccmaster_root, 'mcp', 'stdio_server.py')
+        
+        # Check if stdio_server.py exists
+        if not os.path.exists(stdio_server_path):
+            self.logger.error(f"MCP stdio_server.py not found at: {stdio_server_path}")
+            self.cli_log(f"MCP stdio_server.py not found at: {stdio_server_path}", log_type='warning')
+            return
+        
+        # First, check if ccmaster server is already configured
+        check_cmd = ['claude', 'mcp', 'list']
+        try:
+            result = subprocess.run(check_cmd, capture_output=True, text=True, cwd=working_dir)
+            if result.returncode == 0 and 'ccmaster' in result.stdout:
+                # Remove existing ccmaster server first
+                remove_cmd = ['claude', 'mcp', 'remove', 'ccmaster']
+                subprocess.run(remove_cmd, capture_output=True, text=True, cwd=working_dir)
+                self.logger.info("Removed existing ccmaster MCP server configuration")
+        except Exception as e:
+            self.logger.warning(f"Error checking existing MCP servers: {e}")
+        
+        # Build the claude mcp add command
+        # Using project scope so it's saved in .mcp.json for the project
+        mcp_add_cmd = [
+            'claude', 'mcp', 'add',
+            'ccmaster',  # server name
+            '-s', 'project',  # project scope
+            '--',  # separator for command
+            sys.executable,  # Python interpreter
+            stdio_server_path,
+            '--host', self.mcp_host,
+            '--port', str(self.mcp_port)
+        ]
+        
+        self.cli_log(f"Running: {' '.join(mcp_add_cmd)}", log_type='info')
+        
+        # Execute the command
+        try:
+            result = subprocess.run(mcp_add_cmd, capture_output=True, text=True, cwd=working_dir)
+            
+            if result.returncode == 0:
+                self.cli_log("Added CCMaster MCP server to Claude Code", log_type='info', color=Colors.GREEN)
+                self.cli_log("Server: ccmaster (project scope)", log_type='info')
+                self.cli_log(f"Port: {self.mcp_port}", log_type='info')
+                self.cli_log(f"MCP tools will be available as: /mcp__ccmaster__<tool>", log_type='info', color=Colors.BLUE)
+                
+                self.logger.info(f"Successfully added CCMaster MCP server via 'claude mcp add'")
+                
+                # Verify it was added
+                verify_cmd = ['claude', 'mcp', 'get', 'ccmaster']
+                verify_result = subprocess.run(verify_cmd, capture_output=True, text=True, cwd=working_dir)
+                if verify_result.returncode == 0:
+                    self.logger.info(f"Verified MCP server configuration: {verify_result.stdout.strip()}")
+                
+                # Check if .mcp.json was created
+                mcp_json_path = os.path.join(working_dir, '.mcp.json')
+                if os.path.exists(mcp_json_path):
+                    self.cli_log(f"✓ Created .mcp.json in {working_dir}", log_type='info', color=Colors.GREEN)
+                else:
+                    self.cli_log(f"Warning: .mcp.json not found in {working_dir}", log_type='warning')
+                
+                # Small delay to ensure file is written
+                time.sleep(0.5)
+                
+                # Double-check the file exists and is readable
+                if os.path.exists(mcp_json_path):
+                    try:
+                        with open(mcp_json_path, 'r') as f:
+                            mcp_content = json.load(f)
+                            self.cli_log(f"✓ Verified .mcp.json content: {len(mcp_content.get('mcpServers', {}))} servers", log_type='info', color=Colors.GREEN)
+                    except Exception as e:
+                        self.cli_log(f"Error reading .mcp.json: {e}", log_type='warning')
+            else:
+                error_msg = result.stderr.strip() or result.stdout.strip()
+                self.logger.error(f"Failed to add MCP server: {error_msg}")
+                self.cli_log(f"Failed to add MCP server: {error_msg}", log_type='warning')
+                
+                # Fallback message
+                self.cli_log("You can manually add the MCP server with:", log_type='info')
+                self.cli_log(f"claude mcp add ccmaster -s project -- {sys.executable} {stdio_server_path} --host {self.mcp_host} --port {self.mcp_port}", log_type='info')
+                
+        except FileNotFoundError:
+            self.logger.error("'claude' command not found in PATH")
+            self.cli_log("Error: 'claude' command not found. Make sure Claude Code is installed and in your PATH.", log_type='error')
+            self.cli_log("To manually add the MCP server later:", log_type='info')
+            self.cli_log(f"claude mcp add ccmaster -s project -- {sys.executable} {stdio_server_path} --host {self.mcp_host} --port {self.mcp_port}", log_type='info')
+        except Exception as e:
+            self.logger.error(f"Failed to execute 'claude mcp add': {e}")
+            self.cli_log(f"Error executing 'claude mcp add': {e}", log_type='error')
+    
+    def create_claude_settings(self, working_dir):
+        """Create .claude/settings.local.json to auto-enable MCP servers"""
+        claude_dir = os.path.join(working_dir, '.claude')
+        settings_file = os.path.join(claude_dir, 'settings.local.json')
+        
+        try:
+            # Create .claude directory if it doesn't exist
+            if not os.path.exists(claude_dir):
+                os.makedirs(claude_dir)
+                self.cli_log("✓ Created .claude directory", log_type='info', color=Colors.GREEN)
+            
+            # Create settings to auto-enable MCP servers
+            settings = {
+                "enabledMcpjsonServers": ["ccmaster"],
+                "enableAllProjectMcpServers": True
+            }
+            
+            # Check if settings file already exists
+            if os.path.exists(settings_file):
+                # Read existing settings
+                try:
+                    with open(settings_file, 'r') as f:
+                        existing_settings = json.load(f)
+                    
+                    # Merge with our settings
+                    if "enabledMcpjsonServers" not in existing_settings:
+                        existing_settings["enabledMcpjsonServers"] = []
+                    if "ccmaster" not in existing_settings["enabledMcpjsonServers"]:
+                        existing_settings["enabledMcpjsonServers"].append("ccmaster")
+                    existing_settings["enableAllProjectMcpServers"] = True
+                    settings = existing_settings
+                    self.cli_log("✓ Updated existing Claude settings", log_type='info', color=Colors.GREEN)
+                except Exception as e:
+                    self.cli_log(f"Could not read existing settings, creating new: {e}", log_type='warning')
+            
+            # Write settings file
+            with open(settings_file, 'w') as f:
+                json.dump(settings, f, indent=2)
+            
+            self.cli_log("✓ Created Claude settings to auto-enable MCP", log_type='info', color=Colors.GREEN)
+            self.logger.info(f"Created Claude settings in {settings_file}")
+            
+        except Exception as e:
+            self.logger.warning(f"Failed to create Claude settings: {e}")
+            self.cli_log(f"Could not create Claude settings: {e}", log_type='warning')
+    
+    def remove_from_mcp_config(self, working_dir=None):
+        """Remove CCMaster from Claude Code MCP configuration"""
+        if working_dir is None:
+            working_dir = os.getcwd()
+        else:
+            working_dir = os.path.abspath(working_dir)
+        
+        # Use claude mcp remove command
+        remove_cmd = ['claude', 'mcp', 'remove', 'ccmaster']
+        
+        try:
+            result = subprocess.run(remove_cmd, capture_output=True, text=True, cwd=working_dir)
+            
+            if result.returncode == 0:
+                self.cli_log("Removed CCMaster MCP server from Claude Code", log_type='info')
+                self.logger.info("Successfully removed CCMaster MCP server")
+            else:
+                error_msg = result.stderr.strip() or result.stdout.strip()
+                if 'not found' in error_msg.lower():
+                    self.cli_log("CCMaster MCP server not found in configuration", log_type='info')
+                else:
+                    self.cli_log(f"Error removing MCP server: {error_msg}", log_type='warning')
+                    self.logger.error(f"Failed to remove MCP server: {error_msg}")
+                    
+        except FileNotFoundError:
+            self.cli_log("Error: 'claude' command not found. Make sure Claude Code is installed and in your PATH.", log_type='error')
+            self.logger.error("'claude' command not found in PATH")
+        except Exception as e:
+            self.cli_log(f"Error executing 'claude mcp remove': {e}", log_type='error')
+            self.logger.error(f"Failed to execute 'claude mcp remove': {e}")
+    
+    def check_mcp_status(self):
+        """Check MCP server status"""
+        if self.mcp_enabled and self.mcp_server:
+            server_info = self.mcp_server.get_server_info()
+            self.cli_log("CCMaster MCP Server Status", log_type='info')
+            self.cli_log(f"Running: {server_info['running']}", log_type='info', color=Colors.GREEN if server_info['running'] else Colors.RED)
+            self.cli_log(f"Address: {server_info['host']}:{server_info['port']}", log_type='info')
+            self.cli_log(f"Connected clients: {server_info['connected_clients']}", log_type='info')
+            self.cli_log(f"Available tools: {len(server_info['available_tools'])}", log_type='info')
+            for tool in server_info['available_tools']:
+                self.cli_log(f"- {tool}", log_type='info')
+            
+            # Show port allocation info
+            if self.mcp_port_file.exists():
+                try:
+                    with open(self.mcp_port_file, 'r') as f:
+                        port_data = json.load(f)
+                        self.cli_log(f"Port allocation: Dynamic (last used: {port_data.get('last_port')})", log_type='info')
+                except Exception:
+                    pass
+            self.cli_log(f"Port range: {self.mcp_base_port}-{self.mcp_base_port + 9}", log_type='info')
+        else:
+            self.cli_log("MCP Server is disabled or not running", log_type='info', color=Colors.RED)
+            if not self.mcp_enabled:
+                self.cli_log("Enable in config: ~/.ccmaster/config.json", log_type='info')
+            elif not self.mcp_server:
+                self.cli_log("Start with: ccmaster watch", log_type='info')
+                self.cli_log(f"Port range: {self.mcp_base_port}-{self.mcp_base_port + 9}", log_type='info')
+    
     def create_session(self, working_dir):
         """Create a new session"""
         # Add microseconds to ensure unique IDs when creating multiple sessions quickly
@@ -112,6 +457,17 @@ class CCMaster:
         self.sessions[session_id] = session
         self.save_sessions()
         return session_id
+    
+    def get_session_prefix(self, session_id):
+        """Get session prefix for multi-session mode"""
+        if session_id in self.active_sessions and len(self.active_sessions) >= 2:
+            idx = self.active_sessions[session_id]['index']
+            # Add MCP indicator for MCP-created sessions
+            if session_id.startswith('mcp_'):
+                return f"[MCP-{idx}]"
+            else:
+                return f"[{idx}]"
+        return ""
     
     def log_event(self, session_id, event_type, message, display=True):
         """Log an event for a session"""
@@ -154,25 +510,35 @@ class CCMaster:
         hooks_dir = real_path.parent.parent / 'hooks'
         
         # Create per-session hooks configuration with correct format
+        # Use shell wrappers if they exist, otherwise fall back to direct Python
+        pre_hook = hooks_dir / "pre_tool_use.sh"
+        user_hook = hooks_dir / "user_prompt_submit.sh"
+        stop_hook = hooks_dir / "stop_hook.sh"
+        
+        # Check if shell wrappers exist, otherwise use Python directly
+        pre_cmd = f'bash {str(pre_hook)} {session_id}' if pre_hook.exists() else f'python3 {str(hooks_dir / "pre_tool_use.py")} {session_id}'
+        user_cmd = f'bash {str(user_hook)} {session_id}' if user_hook.exists() else f'python3 {str(hooks_dir / "user_prompt_submit.py")} {session_id}'
+        stop_cmd = f'bash {str(stop_hook)} {session_id}' if stop_hook.exists() else f'python3 {str(hooks_dir / "stop_hook.py")} {session_id}'
+        
         hooks_config = {
             'hooks': {
                 'PreToolUse': [{
                     'matcher': '.*',
                     'hooks': [{
                         'type': 'command',
-                        'command': f'python3 {str(hooks_dir / "pre_tool_use.py")} {session_id}'
+                        'command': pre_cmd
                     }]
                 }],
                 'UserPromptSubmit': [{
                     'hooks': [{
                         'type': 'command',
-                        'command': f'python3 {str(hooks_dir / "user_prompt_submit.py")} {session_id}'
+                        'command': user_cmd
                     }]
                 }],
                 'Stop': [{
                     'hooks': [{
                         'type': 'command',
-                        'command': f'python3 {str(hooks_dir / "stop_hook.py")} {session_id}'
+                        'command': stop_cmd
                     }]
                 }]
             }
@@ -450,6 +816,9 @@ class CCMaster:
                     self.sessions[session_id]['status'] = 'ended'
                     self.sessions[session_id]['ended_at'] = datetime.now().isoformat()
                     self.save_sessions()
+                    # Remove from active sessions to avoid CLI exit
+                    if session_id in self.active_sessions:
+                        del self.active_sessions[session_id]
                     self.log_event(session_id, 'SESSION_END', 'Claude session ended (terminal window closed)')
                     break
                 
@@ -462,10 +831,13 @@ class CCMaster:
                     self.log_event(session_id, 'DEBUG', f'Claude not detected, count: {consecutive_failures}/{max_failures}', display=False)
                     
                     if consecutive_failures >= max_failures:
-                        print(f"\n[{datetime.now().strftime('%H:%M:%S')}] ☠ Claude session appears to have ended")
+                        self.cli_log("Claude session appears to have ended", log_type='end', newline_before=True)
                         self.sessions[session_id]['status'] = 'ended'
                         self.sessions[session_id]['ended_at'] = datetime.now().isoformat()
                         self.save_sessions()
+                        # Remove from active sessions to avoid CLI exit
+                        if session_id in self.active_sessions:
+                            del self.active_sessions[session_id]
                         self.log_event(session_id, 'SESSION_END', 'Claude session ended (process not found)')
                         break
                 
@@ -475,18 +847,18 @@ class CCMaster:
                 self.log_event(session_id, 'ERROR', f'Monitoring error: {str(e)}')
                 break
     
-    def send_continue_to_claude(self, session_id):
-        """Send 'continue' to the specific Claude session only"""
+    def send_continue_to_claude(self, session_id, message="continue"):
+        """Send message to the specific Claude session"""
         # Only use stored window and tab info - no fallback to avoid confusion
         if session_id not in self.sessions:
-            print(f"[{datetime.now().strftime('%H:%M:%S')}] {Colors.YELLOW}▲ Session not found for auto-continue{Colors.RESET}")
+            self.cli_log("Session not found for auto-continue", log_type='warning')
             return False
             
         window_id = self.sessions[session_id].get('terminal_window_id')
         tab_index = self.sessions[session_id].get('terminal_tab_index')
         
         if not window_id or not tab_index:
-            print(f"[{datetime.now().strftime('%H:%M:%S')}] {Colors.YELLOW}▲ No terminal window info stored for this session{Colors.RESET}")
+            self.cli_log("No terminal window info stored for this session", log_type='warning')
             return False
         
         # Use specific window and find Claude tab
@@ -508,10 +880,10 @@ class CCMaster:
                             set selected of t to true
                             delay 0.3
                             
-                            -- Type continue and press return
+                            -- Type message and press return
                             tell application "System Events"
                                 tell process "Terminal"
-                                    keystroke "continue"
+                                    keystroke "{message}"
                                     delay 0.1
                                     keystroke return
                                 end tell
@@ -540,33 +912,33 @@ class CCMaster:
                     return True
                 elif output == "no_claude_in_window":
                     # Check if we're in multi-agent mode
-                    if session_id in self.active_sessions and len(self.active_sessions) >= 2:
-                        idx = self.active_sessions[session_id]['index']
-                        self.thread_safe_print(f"[{idx}][{datetime.now().strftime('%H:%M:%S')}] {Colors.YELLOW}▲ Claude is no longer running in the tracked window{Colors.RESET}")
+                    prefix = self.get_session_prefix(session_id)
+                    if prefix:
+                        self.cli_log("Claude is no longer running in the tracked window", log_type='warning', prefix=prefix)
                     else:
-                        self.thread_safe_print(f"[{datetime.now().strftime('%H:%M:%S')}] {Colors.YELLOW}▲ Claude is no longer running in the tracked window{Colors.RESET}")
+                        self.cli_log("Claude is no longer running in the tracked window", log_type='warning')
                     return False
                 elif output == "window_not_found":
-                    if session_id in self.active_sessions and len(self.active_sessions) >= 2:
-                        idx = self.active_sessions[session_id]['index']
-                        self.thread_safe_print(f"[{idx}][{datetime.now().strftime('%H:%M:%S')}] {Colors.YELLOW}▲ The tracked terminal window no longer exists{Colors.RESET}")
+                    prefix = self.get_session_prefix(session_id)
+                    if prefix:
+                        self.cli_log("The tracked terminal window no longer exists", log_type='warning', prefix=prefix)
                     else:
-                        self.thread_safe_print(f"[{datetime.now().strftime('%H:%M:%S')}] {Colors.YELLOW}▲ The tracked terminal window no longer exists{Colors.RESET}")
+                        self.cli_log("The tracked terminal window no longer exists", log_type='warning')
                     return False
             
-            if session_id in self.active_sessions and len(self.active_sessions) >= 2:
-                idx = self.active_sessions[session_id]['index']
-                self.thread_safe_print(f"[{idx}][{datetime.now().strftime('%H:%M:%S')}] {Colors.RED}✖ Failed to send 'continue' command{Colors.RESET}")
+            prefix = self.get_session_prefix(session_id)
+            if prefix:
+                self.cli_log("Failed to send 'continue' command", log_type='error', prefix=prefix)
             else:
-                self.thread_safe_print(f"[{datetime.now().strftime('%H:%M:%S')}] {Colors.RED}✖ Failed to send 'continue' command{Colors.RESET}")
+                self.cli_log("Failed to send 'continue' command", log_type='error')
             return False
             
         except Exception as e:
-            if session_id in self.active_sessions and len(self.active_sessions) >= 2:
-                idx = self.active_sessions[session_id]['index']
-                self.thread_safe_print(f"[{idx}][{datetime.now().strftime('%H:%M:%S')}] {Colors.RED}✖ Auto-continue error: {str(e)}{Colors.RESET}")
+            prefix = self.get_session_prefix(session_id)
+            if prefix:
+                self.cli_log(f"Auto-continue error: {str(e)}", log_type='error', prefix=prefix)
             else:
-                self.thread_safe_print(f"[{datetime.now().strftime('%H:%M:%S')}] {Colors.RED}✖ Auto-continue error: {str(e)}{Colors.RESET}")
+                self.cli_log(f"Auto-continue error: {str(e)}", log_type='error')
             return False
     
     def start_session_and_monitor(self, working_dir=None, watch_mode=False, max_turns=None):
@@ -580,32 +952,69 @@ class CCMaster:
         # Create session
         session_id = self.create_session(working_dir)
         
+        # Register in active sessions
+        self.active_sessions[session_id] = {
+            'index': 1,
+            'working_dir': working_dir,
+            'created_at': datetime.now().isoformat()
+        }
+        self.watch_modes[session_id] = watch_mode
+        self.auto_continue_counts[session_id] = 0
+        self.has_seen_first_prompt[session_id] = False
+        if max_turns:
+            self.max_turns[session_id] = max_turns
+        
         # Print session info
-        print(f"⟐ Starting Claude session in {working_dir}")
-        print(f"◆ Session ID: {session_id}")
+        self.cli_log(f"Starting Claude session in {working_dir}", log_type='launch')
+        self.cli_log(f"Session ID: {session_id}", log_type='info')
         if watch_mode:
             if max_turns:
-                print(f"⊙ {Colors.GREEN}Watch mode: ON - Will auto-continue after idle (max {max_turns} turns){Colors.RESET}")
+                self.cli_log("Watch mode: ON - Will auto-continue after idle", log_type='info', color=Colors.GREEN)
             else:
-                print(f"⊙ {Colors.GREEN}Watch mode: ON - Will auto-continue after idle{Colors.RESET}")
+                self.cli_log("Watch mode: ON - Will auto-continue after idle", log_type='info', color=Colors.GREEN)
         else:
-            print(f"○ Watch mode: OFF - Press [w] to toggle")
-        print()
+            self.cli_log("Watch mode: OFF - Press [w] to toggle", log_type='info')
         
         self.log_event(session_id, 'SESSION_START', f'Starting in {working_dir}', display=False)
+        
+        # Initialize MCP server if not already started
+        if self.mcp_enabled and not self.mcp_server:
+            self.cli_log("Initializing MCP server...", log_type='info', color=Colors.PURPLE)
+            self.init_mcp_server()
+        
+        # Create project-scoped MCP configuration
+        if self.mcp_enabled and self.mcp_server:
+            self.cli_log(f"Creating MCP configuration in {working_dir}", log_type='info', color=Colors.PURPLE)
+            self.create_project_mcp_config(working_dir)
+            
+            # Create Claude settings to auto-enable MCP
+            self.create_claude_settings(working_dir)
+        else:
+            if not self.mcp_enabled:
+                self.cli_log("MCP is disabled", log_type='warning')
+            elif not self.mcp_server:
+                self.cli_log("MCP server failed to start", log_type='warning')
         
         # Create per-session hooks configuration
         settings_file, backup_file = self.create_hooks_config(session_id)
         self.log_event(session_id, 'HOOKS', f'Created hooks configuration for session', display=False)
         
         # Prepare Claude Code command
+        # Note: Claude needs to be started in the directory containing .mcp.json
         claude_cmd = self.config['claude_code_command'] + ' --dangerously-skip-permissions'
+        
+        # Debug: Show what directory we're launching in
+        self.cli_log(f"Launching Claude Code in: {working_dir}", log_type='info')
+        if os.path.exists(os.path.join(working_dir, '.mcp.json')):
+            self.cli_log("✓ .mcp.json found in launch directory", log_type='info', color=Colors.GREEN)
+        else:
+            self.cli_log(".mcp.json NOT found in launch directory!", log_type='warning')
         
         # AppleScript to open Terminal and start Claude, returning window and tab info
         applescript = f'''
         tell application "Terminal"
             activate
-            set newTab to do script "cd {working_dir} && {claude_cmd}"
+            set newTab to do script "cd '{working_dir}' && pwd && ls -la .mcp.json 2>/dev/null && {claude_cmd}"
             set windowId to id of window 1
             -- Get the tab index
             set tabIndex to 1
@@ -662,10 +1071,7 @@ class CCMaster:
         
         # Initial status
         current_status_display = self.format_status_line('idle')
-        has_seen_first_prompt = False
-        auto_continue_pending = False
-        continue_countdown = 0
-        auto_continue_count = 0
+        last_idle_time = {}
         
         # Initialize current_status for this session
         if isinstance(self.current_status, dict):
@@ -683,144 +1089,196 @@ class CCMaster:
                 # Check for keyboard input
                 key = self.check_keyboard_input()
                 if key == 'q':
-                    self.safe_print(f"\n[{datetime.now().strftime('%H:%M:%S')}] ■ Stopping session monitor...", old_settings)
+                    prefix = self.get_session_prefix(session_id)
+                    self.cli_log("Stopping session monitor...", log_type='end', prefix=prefix, newline_before=True)
                     self.should_stop = True
                     break
                 elif key == 'w':
-                    was_at_max_turns = max_turns and auto_continue_count >= max_turns
+                    current_count = self.auto_continue_counts.get(session_id, 0)
+                    was_at_max_turns = max_turns and current_count >= max_turns
                     watch_mode = not watch_mode
+                    self.watch_modes[session_id] = watch_mode
+                    
                     timestamp = datetime.now()
                     time_str = timestamp.strftime('%H:%M:%S')
                     if watch_mode:
                         # Reset auto-continue count when toggling watch mode on after hitting max
                         if was_at_max_turns:
-                            auto_continue_count = 0
-                            self.safe_print(f"[{time_str}] {Colors.GREEN}↻ Auto-continue count reset{Colors.RESET}", old_settings)
+                            self.auto_continue_counts[session_id] = 0
+                            prefix = self.get_session_prefix(session_id)
+                            self.cli_log("Auto-continue count reset", log_type='info', prefix=prefix, color=Colors.GREEN)
                         
+                        prefix = self.get_session_prefix(session_id)
                         if max_turns:
-                            remaining = max_turns - auto_continue_count
-                            self.safe_print(f"[{time_str}] {Colors.GREEN}⊙ Watch mode: ON - Will auto-continue after idle ({remaining} turns left){Colors.RESET}", old_settings)
+                            current_count = self.auto_continue_counts.get(session_id, 0)
+                            remaining = max_turns - current_count
+                            self.cli_log(f"Watch mode: ON - Will auto-continue after idle ({remaining} turns left)", log_type='info', prefix=prefix, color=Colors.GREEN)
                         else:
-                            self.safe_print(f"[{time_str}] {Colors.GREEN}⊙ Watch mode: ON - Will auto-continue after idle{Colors.RESET}", old_settings)
+                            self.cli_log("Watch mode: ON - Will auto-continue after idle", log_type='info', prefix=prefix, color=Colors.GREEN)
                         
-                        # If we're currently idle and re-enabling after max turns, immediately continue
-                        current_session_status = self.current_status[session_id] if isinstance(self.current_status, dict) else self.current_status
+                        # If we're currently idle and re-enabling after max turns, set idle time for delayed continue
+                        current_session_status = self.current_status.get(session_id) if isinstance(self.current_status, dict) else self.current_status
                         if was_at_max_turns and current_session_status == 'idle':
-                            # Send continue immediately
-                            if self.send_continue_to_claude(session_id):
-                                auto_continue_count += 1
-                                if max_turns:
-                                    self.safe_print(f"[{time_str}] {Colors.GREEN}▶ Auto-continue ({auto_continue_count}/{max_turns}){Colors.RESET}", old_settings)
-                                else:
-                                    self.safe_print(f"[{time_str}] {Colors.GREEN}▶ Auto-continue{Colors.RESET}", old_settings)
+                            # Set idle time to trigger auto-continue after delay
+                            last_idle_time[session_id] = time.time()
                     else:
-                        self.safe_print(f"[{time_str}] ○ Watch mode: OFF", old_settings)
-                        # Cancel any pending auto-continue
-                        auto_continue_pending = False
-                        continue_countdown = 0
+                        prefix = self.get_session_prefix(session_id)
+                        self.cli_log("Watch mode: OFF", log_type='info', prefix=prefix)
+                        # Reset idle time tracking
+                        last_idle_time.clear()
                 
                 # Process messages from queue
                 try:
                     while True:
                         # Get 5-tuple message (session_id, msg_type, timestamp, event_type, message)
                         session_id_from_msg, msg_type, timestamp, event_type, message = self.message_queue.get_nowait()
-                        time_str = timestamp.strftime('%H:%M:%S')
+                        
+                        # Get session prefix for multi-session display
+                        prefix = self.get_session_prefix(session_id_from_msg)
                         
                         if msg_type == 'STATUS':
                             # Handle status updates
                             if 'Working' in message:
-                                status_display = self.format_status_line('working')
+                                self.current_status[session_id_from_msg] = 'working'
                                 if 'tool:' in message:
                                     tool = message.split('tool:')[1].strip()
-                                    self.safe_print(f"[{time_str}] {status_display}", old_settings)
-                                    self.safe_print(f"[{time_str}] → Using {tool}", old_settings)
+                                    self.cli_log(self.format_status_line('working'), log_type='status_working', prefix=prefix)
+                                    self.cli_log(f"Using {tool}", log_type='tool', prefix=prefix)
                                 else:
-                                    self.safe_print(f"[{time_str}] {status_display}", old_settings)
+                                    self.cli_log(self.format_status_line('working'), log_type='status_working', prefix=prefix)
                             elif 'Processing' in message:
-                                status_display = self.format_status_line('processing')
-                                self.safe_print(f"[{time_str}] {status_display}", old_settings)
+                                self.current_status[session_id_from_msg] = 'processing'
+                                self.cli_log(self.format_status_line('processing'), log_type='status_processing', prefix=prefix)
                             elif 'Thinking' in message:
-                                status_display = self.format_status_line('thinking')
-                                self.safe_print(f"[{time_str}] {status_display}", old_settings)
+                                self.current_status[session_id_from_msg] = 'thinking'
+                                self.cli_log(self.format_status_line('thinking'), log_type='status_thinking', prefix=prefix)
                             elif 'Idle' in message:
-                                status_display = self.format_status_line('idle')
-                                self.safe_print(f"[{time_str}] {status_display}", old_settings)
-                                # In watch mode, auto-continue after first prompt
-                                if watch_mode and has_seen_first_prompt:
-                                    # Check if we've reached max turns
-                                    if max_turns is None or auto_continue_count < max_turns:
-                                        auto_continue_pending = True
-                                        continue_countdown = 2  # 2 seconds to ensure Claude is really idle
-                                    else:
-                                        self.safe_print(f"[{time_str}] {Colors.YELLOW}■ Max auto-continue turns ({max_turns}) reached - Watch mode disabled{Colors.RESET}", old_settings)
-                                        self.safe_print(f"[{time_str}] → Press [w] to re-enable and continue", old_settings)
-                                        watch_mode = False
-                            current_status_display = status_display
+                                self.current_status[session_id_from_msg] = 'idle'
+                                # Record when this session became idle for auto-continue delay
+                                last_idle_time[session_id_from_msg] = time.time()
+                                self.cli_log(self.format_status_line('idle'), log_type='status_idle', prefix=prefix)
                             
                         elif event_type == 'USER':
                             # Format user prompt
                             prompt_preview = message[:50] + '...' if len(message) > 50 else message
                             prompt_preview = prompt_preview.replace('\n', ' ')
-                            self.safe_print(f"[{time_str}] ▶ User: \"{prompt_preview}\"", old_settings)
-                            has_seen_first_prompt = True
-                            # Cancel any pending auto-continue when user types
-                            auto_continue_pending = False
-                            continue_countdown = 0
+                            self.cli_log(f"User: \"{prompt_preview}\"", log_type='user', prefix=prefix)
+                            self.has_seen_first_prompt[session_id_from_msg] = True
+                            # Reset idle time when user types
+                            if session_id_from_msg in last_idle_time:
+                                del last_idle_time[session_id_from_msg]
                             
                         elif event_type == 'SESSION_END':
-                            self.safe_print(f"\n[{time_str}] ■ {message}", old_settings)
-                            self.should_stop = True
+                            self.cli_log(message, log_type='end', prefix=prefix, newline_before=True)
+                            # Don't stop CLI - let the session removal logic handle it
                             
                         elif event_type == 'LAUNCH':
-                            self.safe_print(f"[{time_str}] ⟐ {message}", old_settings)
+                            self.cli_log(message, log_type='launch', prefix=prefix)
                             
                         elif event_type == 'PROCESS':
-                            self.safe_print(f"[{time_str}] ◎ {message}", old_settings)
+                            self.cli_log(message, log_type='process', prefix=prefix)
                             
                         elif event_type == 'WARNING':
-                            self.safe_print(f"[{time_str}] {Colors.YELLOW}▲ {message}{Colors.RESET}", old_settings)
+                            self.cli_log(message, log_type='warning', prefix=prefix)
                             
                         elif event_type == 'ERROR':
-                            self.safe_print(f"[{time_str}] {Colors.RED}✖ {message}{Colors.RESET}", old_settings)
+                            self.cli_log(message, log_type='error', prefix=prefix)
                             
                 except queue.Empty:
                     pass
                 
-                # Handle auto-continue countdown
-                if auto_continue_pending and continue_countdown > 0:
-                    time.sleep(1)  # Count down 1 second
-                    continue_countdown -= 1
+                # Check for session terminations and handle auto-continue for ALL active sessions (including MCP-created ones)
+                for check_session_id in list(self.active_sessions.keys()):
+                    if check_session_id not in self.current_status:
+                        continue
                     
-                    if continue_countdown == 0:
-                        # Send continue command
-                        if self.send_continue_to_claude(session_id):
-                            auto_continue_pending = False
-                            auto_continue_count += 1
-                            # Log the successful auto-continue
-                            timestamp = datetime.now()
-                            time_str = timestamp.strftime('%H:%M:%S')
-                            if max_turns:
-                                self.safe_print(f"[{time_str}] {Colors.GREEN}▶ Auto-continue ({auto_continue_count}/{max_turns}){Colors.RESET}", old_settings)
+                    # First check if terminal window is still open
+                    if not self.is_terminal_window_open(check_session_id):
+                        prefix = self.get_session_prefix(check_session_id)
+                        self.cli_log('Terminal window closed', log_type='end', prefix=prefix, newline_before=True)
+                        # Update session status
+                        if check_session_id in self.sessions:
+                            self.sessions[check_session_id]['status'] = 'ended'
+                            self.sessions[check_session_id]['ended_at'] = datetime.now().isoformat()
+                            self.save_sessions()
+                        # Remove from active sessions
+                        del self.active_sessions[check_session_id]
+                        # Clean up session tracking
+                        if check_session_id in self.watch_modes:
+                            del self.watch_modes[check_session_id]
+                        if check_session_id in self.current_status:
+                            del self.current_status[check_session_id]
+                        if check_session_id in self.auto_continue_counts:
+                            del self.auto_continue_counts[check_session_id]
+                        if check_session_id in self.has_seen_first_prompt:
+                            del self.has_seen_first_prompt[check_session_id]
+                        if check_session_id in last_idle_time:
+                            del last_idle_time[check_session_id]
+                        continue
+                    
+                    # Get session-specific watch mode and status
+                    session_watch_mode = self.watch_modes.get(check_session_id, watch_mode if check_session_id == session_id else False)
+                    session_first_prompt = self.has_seen_first_prompt.get(check_session_id, False)
+                    session_idle = self.current_status.get(check_session_id) == 'idle'
+                    
+                    # Handle auto-continue for each idle session with delay
+                    if session_watch_mode and session_idle and session_first_prompt:
+                        # Check if session has been idle long enough (2 seconds delay)
+                        idle_time = last_idle_time.get(check_session_id, 0)
+                        if idle_time > 0 and time.time() - idle_time >= 2.0:
+                            session_max_turns = self.max_turns.get(check_session_id)
+                            session_count = self.auto_continue_counts.get(check_session_id, 0)
+                            
+                            if session_max_turns is None or session_count < session_max_turns:
+                                # Send continue to this specific session
+                                if self.send_continue_to_claude(check_session_id):
+                                    self.auto_continue_counts[check_session_id] = session_count + 1
+                                    
+                                    # Clear idle time to prevent immediate re-trigger
+                                    if check_session_id in last_idle_time:
+                                        del last_idle_time[check_session_id]
+                                    
+                                    # Log with session prefix
+                                    prefix = self.get_session_prefix(check_session_id)
+                                    
+                                    if session_max_turns:
+                                        msg = f"Auto-continue ({session_count + 1}/{session_max_turns})"
+                                    else:
+                                        msg = f"Auto-continue"
+                                    
+                                    if prefix:
+                                        self.cli_log(msg, log_type='auto_continue', prefix=prefix, color=Colors.GREEN)
+                                    else:
+                                        self.cli_log(msg, log_type='auto_continue', color=Colors.GREEN)
+                                    
+                                    self.log_event(check_session_id, 'AUTO_CONTINUE', f'Sent auto-continue #{session_count + 1}', display=False)
                             else:
-                                self.safe_print(f"[{time_str}] {Colors.GREEN}▶ Auto-continue{Colors.RESET}", old_settings)
-                            self.log_event(session_id, 'AUTO_CONTINUE', f'Sent auto-continue #{auto_continue_count}', display=False)
-                        else:
-                            auto_continue_pending = False
-                            self.safe_print(f"[{time_str}] {Colors.YELLOW}▲ Failed to send auto-continue{Colors.RESET}", old_settings)
+                                # Max turns reached, disable watch mode for this session
+                                self.watch_modes[check_session_id] = False
+                                prefix = self.get_session_prefix(check_session_id)
+                                self.cli_log(f"Max auto-continue turns ({session_max_turns}) reached - Watch mode disabled", log_type='warning', prefix=prefix)
+                                self.cli_log("Press [w] to re-enable and continue", log_type='info', prefix=prefix)
+                                if check_session_id in last_idle_time:
+                                    del last_idle_time[check_session_id]
                 
-                # Break if session should stop
+                # Only break if user requested stop or no sessions remain
                 if self.should_stop:
+                    break
+                
+                # Stop if no active sessions remain
+                if not self.active_sessions:
+                    self.cli_log("All sessions ended. Exiting...", log_type='end', newline_before=True)
                     break
                 
                 # Small sleep to prevent busy-waiting
                 time.sleep(0.1)
                 
         except KeyboardInterrupt:
-            print(f"\n[{datetime.now().strftime('%H:%M:%S')}] ■ Session interrupted by user")
+            self.cli_log("Session interrupted by user", log_type='end', newline_before=True)
         finally:
             # Restore terminal settings
             termios.tcsetattr(sys.stdin, termios.TCSADRAIN, old_settings)
-            print("\n■ Session ended.")
+            self.cli_log("Session ended", log_type='end', newline_before=True)
             
             # Update session status
             if session_id in self.sessions:
@@ -838,29 +1296,171 @@ class CCMaster:
         return None
     
     def safe_print(self, message, old_settings):
-        """Safely print in raw terminal mode"""
-        # Temporarily restore normal mode for printing
-        termios.tcsetattr(sys.stdin, termios.TCSADRAIN, old_settings)
-        print(message)
-        sys.stdout.flush()
-        # Return to raw mode
-        tty.setraw(sys.stdin.fileno())
+        """Safely print in raw terminal mode - now delegates to cli_log for consistency"""
+        # Parse the message to determine type and extract components
+        if '●' in message:
+            if 'Idle' in message:
+                self.cli_log('Idle', log_type='status_idle')
+            elif 'Working' in message:
+                self.cli_log('Working', log_type='status_working')
+            elif 'Processing' in message:
+                self.cli_log('Processing', log_type='status_processing')
+            elif 'Thinking' in message:
+                self.cli_log('Thinking', log_type='status_thinking')
+        elif '▶ User:' in message:
+            # Extract user message
+            user_msg = message.split('▶ User: "')[1].rstrip('"')
+            self.cli_log(f'User: "{user_msg}"', log_type='user')
+        elif '→ Using' in message:
+            # Extract tool name
+            tool = message.split('→ Using ')[1]
+            self.cli_log(f'Using {tool}', log_type='tool')
+        elif '▶ Auto-continue' in message:
+            # Extract auto-continue info
+            parts = message.split('▶ ')
+            if len(parts) > 1:
+                self.cli_log(parts[1], log_type='auto_continue', color=Colors.GREEN)
+        elif '⟐' in message:
+            self.cli_log(message.split('⟐ ')[1], log_type='launch')
+        elif '◎' in message:
+            self.cli_log(message.split('◎ ')[1], log_type='process')
+        elif '▲' in message:
+            self.cli_log(message.split('▲ ')[1], log_type='warning')
+        elif '✖' in message:
+            self.cli_log(message.split('✖ ')[1], log_type='error')
+        elif '■' in message:
+            self.cli_log(message.split('■ ')[1], log_type='end')
+        else:
+            # For any other message, just print it as-is
+            with self.print_lock:
+                termios.tcsetattr(sys.stdin, termios.TCSADRAIN, old_settings)
+                self.cli_log(message, log_type='info')
+                tty.setraw(sys.stdin.fileno())
     
-    def thread_safe_print(self, message):
-        """Thread-safe printing that handles raw mode automatically"""
+    # thread_safe_print method removed - all printing now goes through cli_log
+    
+    def is_terminal_window_open(self, session_id):
+        """Check if the Terminal window for this session is still open"""
+        if session_id not in self.sessions or 'terminal_window_id' not in self.sessions[session_id]:
+            return True  # If we don't have window info, assume it's open
+        
+        window_id = self.sessions[session_id]['terminal_window_id']
+        
+        # AppleScript to check if window exists
+        check_script = f'''
+        tell application "Terminal"
+            try
+                set w to window id {window_id}
+                return "exists"
+            on error
+                return "not_found"
+            end try
+        end tell
+        '''
+        
+        try:
+            result = subprocess.run(['osascript', '-e', check_script], capture_output=True, text=True)
+            if result.returncode == 0:
+                return result.stdout.strip() == "exists"
+            return False
+        except Exception:
+            return True  # If we can't check, assume it's still open
+    
+    def cli_log(self, message, log_type='info', prefix='', color=None, newline_before=False, session_id=None):
+        """
+        Standardized CLI logging with proper alignment and thread safety
+        
+        Args:
+            message: The message to log
+            log_type: Type of log ('info', 'status', 'warning', 'error', 'mcp', 'user', 'tool')
+            prefix: Optional prefix (e.g., '[1]' for multi-session)
+            color: Optional color override (Colors.GREEN, etc.)
+            newline_before: Add newline before message
+            session_id: Session ID for context
+        """
+        # Get timestamp
+        timestamp = datetime.now().strftime('%H:%M:%S')
+        
+        # Determine color based on type if not specified
+        if color is None:
+            color_map = {
+                'warning': Colors.YELLOW,
+                'error': Colors.RED,
+                'success': Colors.GREEN,
+                'mcp': '\033[96m',  # Cyan
+                'tool': Colors.ORANGE,  # Changed to orange
+            }
+            color = color_map.get(log_type, '')
+        
+        # Format symbols based on type
+        symbol_map = {
+            'status_idle': '●',
+            'status_working': '●',
+            'status_processing': '●',
+            'status_thinking': '●',
+            'launch': '⟐',
+            'process': '◎',
+            'user': '▶',
+            'tool': '→',
+            'warning': '▲',
+            'error': '✖',
+            'end': '■',
+            'mcp': '[MCP]',
+            'auto_continue': '▶',
+            'info': '◆',
+        }
+        symbol = symbol_map.get(log_type, '')
+        
+        # Build the formatted message
+        if prefix:
+            formatted_msg = f"{prefix}[{timestamp}] "
+        else:
+            formatted_msg = f"[{timestamp}] "
+        
+        if symbol:
+            formatted_msg += f"{symbol} "
+        
+        formatted_msg += message
+        
+        # Apply color
+        if color:
+            if color == '\033[96m':  # Cyan for MCP
+                formatted_msg = f"{color}{formatted_msg}\033[0m"
+            else:
+                formatted_msg = f"{color}{formatted_msg}{Colors.RESET}"
+        
+        # Add newline before if requested
+        if newline_before:
+            formatted_msg = '\n' + formatted_msg
+        
+        # Use thread-safe printing with proper cleanup
         with self.print_lock:
             try:
-                # Try to get current terminal settings
-                old_settings = termios.tcgetattr(sys.stdin)
-                # Temporarily switch to normal mode
-                termios.tcsetattr(sys.stdin, termios.TCSADRAIN, old_settings)
-                print(message)
+                # Save current cursor position and clear line
+                sys.stdout.write('\r\033[K')  # Move to start of line and clear
+                
+                # Try to get current terminal settings (in case we're in raw mode)
+                try:
+                    old_settings = termios.tcgetattr(sys.stdin)
+                    is_raw_mode = True
+                    # Temporarily switch to normal mode
+                    termios.tcsetattr(sys.stdin, termios.TCSADRAIN, old_settings)
+                except:
+                    is_raw_mode = False
+                
+                # Print the formatted message
+                print(formatted_msg)
                 sys.stdout.flush()
-                # Return to raw mode
-                tty.setraw(sys.stdin.fileno())
-            except:
-                # If not in raw mode, just print normally
-                print(message)
+                
+                # Return to raw mode if we were in it
+                if is_raw_mode:
+                    try:
+                        tty.setraw(sys.stdin.fileno())
+                    except:
+                        pass
+            except Exception as e:
+                # Fallback: just print
+                print(formatted_msg)
                 sys.stdout.flush()
     
     def monitor_status(self, session_id):
@@ -931,12 +1531,12 @@ class CCMaster:
     def list_sessions(self):
         """List all sessions"""
         if not self.sessions:
-            print("No sessions found.")
+            self.cli_log("No sessions found.", log_type='info')
             return
         
-        print(f"{Colors.BOLD}Sessions:{Colors.RESET}")
-        print(f"{'ID':<20} {'Status':<10} {'Started':<20} {'Directory'}")
-        print("-" * 80)
+        self.cli_log("Sessions:", log_type='info')
+        self.cli_log(f"{'ID':<20} {'Status':<10} {'Started':<20} {'Directory'}", log_type='info')
+        self.cli_log("-" * 80, log_type='info')
         
         for session_id, session in sorted(self.sessions.items(), reverse=True):
             started = datetime.fromisoformat(session['started_at']).strftime('%Y-%m-%d %H:%M:%S')
@@ -948,17 +1548,24 @@ class CCMaster:
             else:
                 status_colored = status
             
-            print(f"{session_id:<20} {status_colored:<19} {started:<20} {session['working_dir']}")
+            # Format status without color codes for alignment
+            status_str = f"{session_id:<20} {status:<10} {started:<20} {session['working_dir']}"
+            if status == 'running':
+                self.cli_log(status_str, log_type='info', color=Colors.GREEN)
+            elif status == 'ended':
+                self.cli_log(status_str, log_type='info', color=Colors.RED)
+            else:
+                self.cli_log(status_str, log_type='info')
     
     def view_logs(self, session_id):
         """View logs for a specific session"""
         log_file = self.logs_dir / f"{session_id}.log"
         if not log_file.exists():
-            print(f"No logs found for session {session_id}")
+            self.cli_log(f"No logs found for session {session_id}", log_type='warning')
             return
         
-        print(f"{Colors.BOLD}Logs for session {session_id}:{Colors.RESET}")
-        print("-" * 80)
+        self.cli_log(f"Logs for session {session_id}:", log_type='info')
+        self.cli_log("-" * 80, log_type='info')
         
         with open(log_file, 'r') as f:
             for line in f:
@@ -978,19 +1585,28 @@ class CCMaster:
                     else:
                         type_colored = event_type
                     
-                    print(f"[{timestamp}] {type_colored:<20} {message}")
+                    # Format log entry with appropriate color
+                    log_str = f"[{timestamp}] {event_type:<20} {message}"
+                    if event_type == 'ERROR':
+                        self.cli_log(log_str, log_type='error')
+                    elif event_type == 'SESSION_START':
+                        self.cli_log(log_str, log_type='info', color=Colors.GREEN)
+                    elif event_type == 'SESSION_END':
+                        self.cli_log(log_str, log_type='warning')
+                    else:
+                        self.cli_log(log_str, log_type='info')
                 except json.JSONDecodeError:
-                    print(line.strip())
+                    self.cli_log(line.strip(), log_type='info')
     
     def view_prompts(self, session_id):
         """View user prompts for a specific session"""
         prompt_file = self.logs_dir / f"{session_id}_prompts.log"
         if not prompt_file.exists():
-            print(f"No prompts found for session {session_id}")
+            self.cli_log(f"No prompts found for session {session_id}", log_type='warning')
             return
         
-        print(f"{Colors.BOLD}User prompts for session {session_id}:{Colors.RESET}")
-        print("-" * 80)
+        self.cli_log(f"User prompts for session {session_id}:", log_type='info')
+        self.cli_log("-" * 80, log_type='info')
         
         with open(prompt_file, 'r') as f:
             for line in f:
@@ -999,11 +1615,11 @@ class CCMaster:
                     timestamp = datetime.fromisoformat(entry['timestamp']).strftime('%Y-%m-%d %H:%M:%S')
                     prompt = entry['prompt']
                     
-                    print(f"{Colors.BLUE}[{timestamp}]{Colors.RESET}")
-                    print(f"{prompt}")
-                    print("-" * 40)
+                    self.cli_log(f"[{timestamp}]", log_type='info', color=Colors.BLUE)
+                    self.cli_log(prompt, log_type='info')
+                    self.cli_log("-" * 40, log_type='info')
                 except json.JSONDecodeError:
-                    print(line.strip())
+                    self.cli_log(line.strip(), log_type='info')
 
     def start_multi_session_and_monitor(self, working_dir=None, watch_mode=False, max_turns=None, num_instances=2):
         """Start multiple Claude sessions and monitor them concurrently"""
@@ -1013,15 +1629,14 @@ class CCMaster:
         else:
             working_dir = os.path.abspath(working_dir)
         
-        print(f"⟐ Starting {num_instances} Claude sessions in {working_dir}")
+        self.cli_log(f"Starting {num_instances} Claude sessions in {working_dir}", log_type='launch')
         if watch_mode:
             if max_turns:
-                print(f"👁️  {Colors.GREEN}Watch mode: ON - Will auto-continue after idle (max {max_turns} turns per session){Colors.RESET}")
+                self.cli_log(f"Watch mode: ON - Will auto-continue after idle (max {max_turns} turns per session)", log_type='info', color=Colors.GREEN)
             else:
-                print(f"⊙ {Colors.GREEN}Watch mode: ON - Will auto-continue after idle{Colors.RESET}")
+                self.cli_log("Watch mode: ON - Will auto-continue after idle", log_type='info', color=Colors.GREEN)
         else:
-            print(f"👀 Watch mode: OFF - Press [w] to toggle for all sessions")
-        print()
+            self.cli_log("Watch mode: OFF - Press [w] to toggle for all sessions", log_type='info')
         
         # Create all sessions
         session_ids = []
@@ -1039,10 +1654,12 @@ class CCMaster:
             self.max_turns[session_id] = max_turns
             self.has_seen_first_prompt[session_id] = False
             
-            print(f"[{i+1}] ◆ Session ID: {session_id}")
+            # Add MCP indicator for MCP-created sessions
+            if session_id.startswith('mcp_'):
+                self.cli_log(f"Session ID: {session_id}", log_type='info', prefix=f"[MCP-{i+1}]")
+            else:
+                self.cli_log(f"Session ID: {session_id}", log_type='info', prefix=f"[{i+1}]")
             self.log_event(session_id, 'SESSION_START', f'Starting session {i+1} of {num_instances} in {working_dir}', display=False)
-        
-        print()
         
         # Launch all sessions with slight delay between each
         for i, session_id in enumerate(session_ids):
@@ -1057,7 +1674,7 @@ class CCMaster:
             applescript = f'''
             tell application "Terminal"
                 activate
-                set newTab to do script "cd {working_dir} && {claude_cmd}"
+                set newTab to do script "cd '{working_dir}' && pwd && ls -la .mcp.json 2>/dev/null && {claude_cmd}"
                 set windowId to id of window 1
                 set tabIndex to 1
                 repeat with t in tabs of window 1
@@ -1117,8 +1734,8 @@ class CCMaster:
             if i < num_instances - 1:
                 time.sleep(1)
         
-        print("\n✻ All sessions launched. Monitoring...")
-        print("Press [q] to quit, [w] to toggle watch mode for all sessions\n")
+        self.cli_log("All sessions launched. Monitoring...", log_type='launch', newline_before=True)
+        self.cli_log("Press [q] to quit, [w] to toggle watch mode for all sessions", log_type='info', newline_before=True)
         
         # Message printer thread for multi-agent
         printer_thread = threading.Thread(
@@ -1139,7 +1756,7 @@ class CCMaster:
                 # Check for keyboard input
                 key = self.check_keyboard_input()
                 if key == 'q':
-                    self.safe_print(f"\n[{datetime.now().strftime('%H:%M:%S')}] ■ Stopping all session monitors...", old_settings)
+                    self.cli_log("Stopping all session monitors...", log_type='end', newline_before=True)
                     self.should_stop = True
                     break
                 elif key == 'w':
@@ -1150,11 +1767,10 @@ class CCMaster:
                         if new_watch_mode and self.max_turns[sid] and self.auto_continue_counts[sid] >= self.max_turns[sid]:
                             self.auto_continue_counts[sid] = 0
                     
-                    time_str = datetime.now().strftime('%H:%M:%S')
                     if new_watch_mode:
-                        self.safe_print(f"\n[{time_str}] {Colors.GREEN}👁️  Watch mode: ON for all sessions{Colors.RESET}", old_settings)
+                        self.cli_log("Watch mode: ON for all sessions", log_type='info', color=Colors.GREEN, newline_before=True)
                     else:
-                        self.safe_print(f"\n[{time_str}] 👀 Watch mode: OFF for all sessions", old_settings)
+                        self.cli_log("Watch mode: OFF for all sessions", log_type='info', newline_before=True)
                 
                 # Check session statuses and handle auto-continue
                 for session_id in list(self.active_sessions.keys()):
@@ -1189,11 +1805,11 @@ class CCMaster:
                 time.sleep(2)
                 
         except KeyboardInterrupt:
-            print(f"\n[{datetime.now().strftime('%H:%M:%S')}] 🛑 Sessions interrupted by user")
+            self.cli_log("Sessions interrupted by user", log_type='end', newline_before=True)
         finally:
             # Restore terminal settings
             termios.tcsetattr(sys.stdin, termios.TCSADRAIN, old_settings)
-            print("\n🛑 All sessions ended.")
+            self.cli_log("All sessions ended.", log_type='end', newline_before=True)
             
             # Update session statuses
             for session_id in session_ids:
@@ -1253,9 +1869,9 @@ class CCMaster:
                         # Temporarily switch out of raw mode for clean printing
                         if old_settings:
                             termios.tcsetattr(sys.stdin, termios.TCSADRAIN, old_settings)
-                        print(f"{prefix}[{time_str}] {status_line}")
+                        self.cli_log(status_line, log_type=f'status_{status}', prefix=prefix)
                         if tool:
-                            print(f"{prefix}[{time_str}] → Using {tool}")
+                            self.cli_log(f"Using {tool}", log_type='tool', prefix=prefix)
                         sys.stdout.flush()
                         if old_settings:
                             tty.setraw(sys.stdin.fileno())
@@ -1266,7 +1882,7 @@ class CCMaster:
                         # Temporarily switch out of raw mode
                         if old_settings:
                             termios.tcsetattr(sys.stdin, termios.TCSADRAIN, old_settings)
-                        print(f"{prefix}[{time_str}] ▶ User: \"{prompt_preview}\"")
+                        self.cli_log(f"User: \"{prompt_preview}\"", log_type='user', prefix=prefix)
                         sys.stdout.flush()
                         if old_settings:
                             tty.setraw(sys.stdin.fileno())
@@ -1279,20 +1895,20 @@ class CCMaster:
                             termios.tcsetattr(sys.stdin, termios.TCSADRAIN, old_settings)
                             
                         if event_type == 'AUTO_CONTINUE':
-                            print(f"{prefix}[{time_str}] {Colors.GREEN}▶ {message}{Colors.RESET}")
+                            self.cli_log(message, log_type='auto_continue', prefix=prefix, color=Colors.GREEN)
                         elif event_type == 'SESSION_END':
-                            print(f"{prefix}[{time_str}] {Colors.RED}☠ {message}{Colors.RESET}")
+                            self.cli_log(message, log_type='end', prefix=prefix)
                         elif event_type == 'PROCESS':
-                            print(f"{prefix}[{time_str}] ◎ {message}")
+                            self.cli_log(message, log_type='process', prefix=prefix)
                         elif event_type == 'LAUNCH':
-                            print(f"{prefix}[{time_str}] ⟐ {message}")
+                            self.cli_log(message, log_type='launch', prefix=prefix)
                         elif event_type == 'WARNING':
-                            print(f"{prefix}[{time_str}] {Colors.YELLOW}▲ {message}{Colors.RESET}")
+                            self.cli_log(message, log_type='warning', prefix=prefix)
                         elif event_type == 'ERROR':
-                            print(f"{prefix}[{time_str}] {Colors.RED}✖ {message}{Colors.RESET}")
+                            self.cli_log(message, log_type='error', prefix=prefix)
                         else:
                             # Generic log message
-                            print(f"{prefix}[{time_str}] {message}")
+                            self.cli_log(message, log_type='info', prefix=prefix)
                             
                         sys.stdout.flush()
                         if old_settings:
@@ -1303,7 +1919,7 @@ class CCMaster:
             except Exception as e:
                 if not self.should_stop:
                     with self.print_lock:
-                        print(f"\nError in multi-session printer: {e}")
+                        self.cli_log(f"Error in multi-session printer: {e}", log_type='error', newline_before=True)
 
 def main():
     parser = argparse.ArgumentParser(description='CCMaster - Claude Code Session Manager')
@@ -1334,32 +1950,70 @@ def main():
     # Version command
     version_parser = subparsers.add_parser('version', help='Show CCMaster version')
     
+    # MCP management commands
+    mcp_parser = subparsers.add_parser('mcp', help='MCP management commands')
+    mcp_subparsers = mcp_parser.add_subparsers(dest='mcp_command', help='MCP commands')
+    
+    # MCP remove command
+    mcp_remove_parser = mcp_subparsers.add_parser('remove', help='Remove CCMaster from project .mcp.json')
+    mcp_remove_parser.add_argument('-d', '--dir', help='Project directory (defaults to current directory)')
+    
+    # MCP status command
+    mcp_status_parser = mcp_subparsers.add_parser('status', help='Check MCP server status')
+    
     args = parser.parse_args()
     
     cc = CCMaster()
+    
+    # Cleanup function
+    def cleanup():
+        cc.stop_mcp_server()
+        cc.should_stop = True
+    
+    # Register cleanup for graceful shutdown
+    import atexit
+    atexit.register(cleanup)
     
     # Default to 'start' if no command specified
     if args.command is None:
         args.command = 'start'
         args.dir = None
     
-    if args.command == 'start':
-        cc.start_session_and_monitor(args.dir if hasattr(args, 'dir') else None)
-    elif args.command == 'watch':
-        if args.instances > 1:
-            cc.start_multi_session_and_monitor(args.dir, watch_mode=True, max_turns=args.maxturn, num_instances=args.instances)
-        else:
-            cc.start_session_and_monitor(args.dir, watch_mode=True, max_turns=args.maxturn)
-    elif args.command == 'list':
-        cc.list_sessions()
-    elif args.command == 'logs':
-        cc.view_logs(args.session_id)
-    elif args.command == 'prompts':
-        cc.view_prompts(args.session_id)
-    elif args.command == 'version':
-        print(f"CCMaster version {__version__}")
-        print(f"⟐ Claude Code Session Manager")
-        print(f"◆ https://github.com/yourusername/ccmaster")
+    try:
+        if args.command == 'start':
+            cc.start_session_and_monitor(args.dir if hasattr(args, 'dir') else None)
+        elif args.command == 'watch':
+            if args.instances > 1:
+                cc.start_multi_session_and_monitor(args.dir, watch_mode=True, max_turns=args.maxturn, num_instances=args.instances)
+            else:
+                cc.start_session_and_monitor(args.dir, watch_mode=True, max_turns=args.maxturn)
+        elif args.command == 'list':
+            cc.list_sessions()
+        elif args.command == 'logs':
+            cc.view_logs(args.session_id)
+        elif args.command == 'prompts':
+            cc.view_prompts(args.session_id)
+        elif args.command == 'version':
+            cc.cli_log(f"CCMaster version {__version__}", log_type='info')
+            cc.cli_log("Claude Code Session Manager", log_type='launch')
+            cc.cli_log("https://github.com/yourusername/ccmaster", log_type='info')
+        elif args.command == 'mcp':
+            if args.mcp_command == 'remove':
+                cc.remove_from_mcp_config(args.dir)
+            elif args.mcp_command == 'status':
+                cc.check_mcp_status()
+            else:
+                cc.cli_log("Usage: ccmaster mcp [remove|status]", log_type='info')
+    finally:
+        cleanup()
 
 if __name__ == '__main__':
-    main()
+    try:
+        main()
+    except KeyboardInterrupt:
+        print("\nShutting down CCMaster...")
+        # Cleanup will be handled by the CCMaster instance
+        sys.exit(0)
+    except Exception as e:
+        print(f"Error: {e}")
+        sys.exit(1)
