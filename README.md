@@ -5,7 +5,7 @@ CCMaster is an intelligent session management tool for Claude Code. It automatic
 ## ✨ Key Features
 
 - 🚀 **One-Command Launch**: Automatically opens Terminal and starts Claude Code sessions
-- 📊 **Real-time Status Monitoring**: Displays Claude's working status (Idle/Processing/Working)
+- 📊 **Real-time Status Monitoring**: Displays Claude's working status (Idle/Processing/Working)  
 - 🔧 **Tool Activity Tracking**: Shows which tools Claude is currently using
 - 👁️ **Watch Mode**: Automatically sends "continue" when Claude becomes idle
 - 🎯 **Per-Session Hooks**: Each session has isolated hook configurations for better control
@@ -15,6 +15,10 @@ CCMaster is an intelligent session management tool for Claude Code. It automatic
 - 🔢 **Turn Limiting**: Set maximum auto-continue turns with --maxturn
 - 🤝 **Multi-Agent Support**: Manage multiple Claude sessions simultaneously with --instances
 - 🔗 **MCP Integration**: Automatic Model Context Protocol support for inter-session communication
+- 🌐 **Dynamic Session Creation**: Claude can create new sessions on-demand using MCP tools
+- 💬 **Cross-Session Communication**: Send messages and coordinate tasks between sessions
+- 🔄 **Unified Session Management**: All sessions (original + MCP-created) tracked with consistent prefixes
+- 🛡️ **Session Lifecycle Control**: CLI stays alive until all sessions end, proper cleanup on termination
 
 ## 🛠 Installation
 
@@ -76,7 +80,7 @@ ccmaster prompts 20240124_143022
 # Check MCP server status
 ccmaster mcp status
 
-# Remove CCMaster from project .mcp.json
+# Remove CCMaster from project .mcp.json  
 ccmaster mcp remove
 ```
 
@@ -175,25 +179,30 @@ CCMaster uses a hooks-based architecture to monitor Claude Code:
 
 ### Multi-Agent Architecture
 
-With `--instances`, CCMaster can manage multiple Claude sessions:
+CCMaster supports both pre-planned (`--instances`) and dynamic (MCP-created) session management:
 
 ```
 ┌─────────────┐     ┌──────────────┐     ┌─────────────┐
 │   CCMaster  │────▶│ Claude Code 1│────▶│   Hooks 1   │
 │   Monitor   │     └──────────────┘     └─────────────┘
-│             │     ┌──────────────┐     ┌─────────────┐
-│             │────▶│ Claude Code 2│────▶│   Hooks 2   │
+│      +      │     ┌──────────────┐     ┌─────────────┐
+│ MCP Server  │────▶│ Claude Code 2│────▶│   Hooks 2   │
 │             │     └──────────────┘     └─────────────┘
 │             │     ┌──────────────┐     ┌─────────────┐
-│             │────▶│ Claude Code N│────▶│   Hooks N   │
+│             │◀────│MCP-Created N │────▶│   Hooks N   │
 └─────────────┘     └──────────────┘     └─────────────┘
+       ▲                     │
+       │                     │
+       └─────────────────────┘
+         Inter-Session Communication
 ```
 
-Each session:
-- Has its own Terminal window/tab
-- Maintains independent status tracking
-- Has isolated hook configurations
-- Can be auto-continued individually
+Each session (original or MCP-created):
+- Has its own Terminal window/tab with unique prefix ([1], [MCP-2])
+- Maintains independent status tracking and auto-continue
+- Has isolated hook configurations for clean monitoring
+- Can communicate with other sessions via MCP tools
+- Supports dynamic creation during runtime
 
 ### Key Components
 
@@ -224,6 +233,13 @@ Each session:
    - Clear success/failure feedback
    - No dependency on window focus or precise timing
 
+5. **MCP Server & Tools** (`ccmaster/mcp/`)
+   - `server.py` - Main MCP server with session management tools
+   - `tools.py` - Session management tool implementations
+   - Dynamic session creation and coordination capabilities
+   - Cross-session communication and monitoring
+   - Automatic project configuration and Claude integration
+
 ## 🔧 Configuration
 
 Configuration file location: `~/.ccmaster/config.json`
@@ -244,40 +260,149 @@ Note: CCMaster automatically adds the `--dangerously-skip-permissions` flag to a
 
 Note: CCMaster always uses the current working directory by default when starting a session.
 
-## 🔗 MCP Integration
+## 🔗 MCP Integration & Multi-Agent Coordination
 
-CCMaster includes automatic Model Context Protocol (MCP) support, enabling intelligent inter-session communication:
+CCMaster provides seamless Model Context Protocol (MCP) integration, enabling powerful multi-agent workflows and inter-session communication:
 
-### Automatic Setup
-When you run `ccmaster watch`, it automatically:
-1. Finds an available port (8080-8090) and starts MCP server
-2. Creates `.mcp.json` in your project directory with the correct port
-3. Claude Code detects it and enables MCP tools
+### Automatic MCP Setup
+When you run `ccmaster watch`, CCMaster automatically:
+1. **Starts MCP Server**: Finds an available port (8080-8090) and launches the MCP server
+2. **Project Configuration**: Creates `.mcp.json` in your project directory with correct server details
+3. **Claude Integration**: Claude Code automatically detects and connects to the MCP server
+4. **Session Management**: All sessions (original and MCP-created) are tracked and monitored
 
-### Available MCP Tools
-In Claude Code, you can use these tools:
-- `/mcp__ccmaster__list_sessions` - List all active sessions
-- `/mcp__ccmaster__send_message_to_session` - Send messages between sessions
-- `/mcp__ccmaster__create_session` - Create new sessions programmatically
-- `/mcp__ccmaster__kill_session` - Terminate sessions
-- `/mcp__ccmaster__spawn_temp_session` - Run temporary sessions
-- `/mcp__ccmaster__coordinate_sessions` - Coordinate multi-agent tasks
-- `/mcp__ccmaster__get_session_logs` - Access session logs
-- `/mcp__ccmaster__get_session_status` - Check session status
+### Multi-Agent Session Creation
+Claude can create new sessions on-demand using MCP tools:
 
-### Example Usage
 ```bash
-# In Claude Code, after running ccmaster watch:
-/mcp__ccmaster__list_sessions
+# Create a new session for a specific task
+/mcp__ccmaster__create_session working_dir="/path/to/project" watch_mode=true max_turns=50
 
-# Send a message to another session
-/mcp__ccmaster__send_message_to_session session_id="20250119_123456" message="Please implement the user API"
-
-# Coordinate multiple sessions
-/mcp__ccmaster__coordinate_sessions task_description="Build full-stack app" session_assignments='{"frontend_session": "Build React UI", "backend_session": "Create API endpoints"}'
+# Output shows new session being tracked:
+[1][14:30:22] ● Processing  
+[MCP-2][14:30:25] 🚀 Launched Claude in Terminal (Window: 4211, Tab: 3)
+[MCP-2][14:30:26] ● Idle
 ```
 
-For detailed MCP documentation, see [MCP_SESSION_INTEGRATION.md](MCP_SESSION_INTEGRATION.md)
+### Available MCP Tools
+CCMaster provides comprehensive session management tools within Claude:
+
+**Session Management:**
+- `list_sessions` - List all active and ended sessions with detailed status
+- `get_session_status` - Get real-time status of any session
+- `create_session` - Create new Claude Code sessions programmatically
+- `kill_session` - Terminate specific sessions cleanly
+
+**Inter-Session Communication:**
+- `send_message_to_session` - Send prompts/commands between sessions
+- `coordinate_sessions` - Orchestrate multiple sessions for complex tasks
+- `get_session_logs` - Access session logs and conversation history
+
+**Temporary Tasks:**
+- `spawn_temp_session` - Create, execute, and cleanup temporary sessions
+- `prompt` - Send messages to the CCMaster console (demo/debugging)
+
+### Advanced Multi-Agent Workflows
+
+**1. Dynamic Session Creation**
+```bash
+# Claude can create specialized sessions on demand:
+/mcp__ccmaster__create_session working_dir="/frontend" watch_mode=true
+/mcp__ccmaster__create_session working_dir="/backend" watch_mode=true
+/mcp__ccmaster__create_session working_dir="/docs" watch_mode=false max_turns=1
+```
+
+**2. Task Coordination**
+```bash
+# Assign different parts of a project to different sessions:
+/mcp__ccmaster__coordinate_sessions 
+  task_description="Build e-commerce platform" 
+  session_assignments='{
+    "mcp_20250119_143022": "Build React frontend with cart and checkout",
+    "mcp_20250119_143025": "Create Node.js API with payment integration", 
+    "mcp_20250119_143028": "Set up PostgreSQL database and migrations"
+  }'
+```
+
+**3. Cross-Session Communication**
+```bash
+# Send status updates between sessions:
+/mcp__ccmaster__send_message_to_session 
+  session_id="mcp_20250119_143022" 
+  message="API endpoints are ready. Please update frontend to use /api/products and /api/cart"
+  wait_for_response=true
+```
+
+**4. Session Monitoring & Control**
+```bash
+# Monitor all sessions:
+/mcp__ccmaster__list_sessions include_ended=false
+
+# Check specific session status:
+/mcp__ccmaster__get_session_status session_id="mcp_20250119_143022"
+
+# Get recent logs from a session:
+/mcp__ccmaster__get_session_logs session_id="mcp_20250119_143022" lines=50
+```
+
+### Unified Session Management
+CCMaster treats all sessions equally - original and MCP-created sessions have:
+- **Auto-Continue Support**: All sessions support watch mode and auto-continuation
+- **Session Prefixes**: Clear labeling ([1], [MCP-2], [MCP-3]) for easy identification
+- **Terminal Tracking**: Proper window/tab tracking for accurate auto-continue
+- **Lifecycle Management**: CLI stays alive until all sessions end
+- **Status Monitoring**: Real-time status updates for all sessions
+
+### Example Multi-Agent Output
+```
+🚀 Starting Claude session in /Users/yourname/project
+📍 Session ID: 20250119_143022  
+👁️  Watch mode: ON - MCP Server running on port 8082
+
+[1][14:30:22] ● Processing
+[1][14:30:25] ▶ User: "Create a multi-service architecture"
+[1][14:30:28] ● Working → Using create_session
+[MCP-2][14:30:30] 🚀 Launched Claude in Terminal (Window: 4211, Tab: 3)
+[1][14:30:32] ● Working → Using create_session  
+[MCP-3][14:30:34] 🚀 Launched Claude in Terminal (Window: 4211, Tab: 4)
+[1][14:30:36] ● Working → Using coordinate_sessions
+[MCP-2][14:30:38] ▶ Coordination: "Build React frontend components"
+[MCP-3][14:30:38] ▶ Coordination: "Create Express.js API endpoints"
+[1][14:30:40] ● Idle
+[MCP-2][14:30:42] ● Working → Using Write
+[MCP-3][14:30:43] ● Working → Using Write
+[1][14:30:45] ▶ Auto-continue (1/∞)
+```
+
+### MCP Configuration
+The MCP server automatically configures itself with these settings:
+
+```json
+{
+  "mcp": {
+    "enabled": true,
+    "host": "localhost", 
+    "port_range": [8080, 8090]
+  }
+}
+```
+
+Project `.mcp.json` is created automatically:
+```json
+{
+  "mcpServers": {
+    "ccmaster": {
+      "command": "python",
+      "args": ["/path/to/ccmaster/mcp/server.py"],
+      "env": {
+        "PORT": "8082"
+      }
+    }
+  }
+}
+```
+
+For detailed MCP implementation details, see [MCP_SESSION_INTEGRATION.md](MCP_SESSION_INTEGRATION.md)
 
 ## 📁 File Structure
 
