@@ -25,6 +25,48 @@ fi
 chmod +x "$SCRIPT_DIR/ccmaster/bin/ccmaster"
 chmod +x "$SCRIPT_DIR/ccmaster/hooks"/*.py
 
+# Initialize CCMaster config
+CONFIG_DIR="$HOME/.ccmaster"
+CONFIG_FILE="$CONFIG_DIR/config.json"
+
+# Create config directory if it doesn't exist
+mkdir -p "$CONFIG_DIR"
+
+# Create or update config file with required settings
+if [ ! -f "$CONFIG_FILE" ]; then
+    echo "Creating initial configuration..."
+    cat > "$CONFIG_FILE" << 'EOF'
+{
+  "claude_code_command": "claude",
+  "monitor_interval": 0.5
+}
+EOF
+else
+    # Check if claude_code_command exists in config
+    if ! grep -q "claude_code_command" "$CONFIG_FILE"; then
+        echo "Updating configuration with missing claude_code_command..."
+        # Create a backup
+        cp "$CONFIG_FILE" "$CONFIG_FILE.backup"
+        # Add claude_code_command to existing config
+        python3 -c "
+import json
+import sys
+try:
+    with open('$CONFIG_FILE', 'r') as f:
+        config = json.load(f)
+    config['claude_code_command'] = 'claude'
+    if 'monitor_interval' not in config:
+        config['monitor_interval'] = 0.5
+    with open('$CONFIG_FILE', 'w') as f:
+        json.dump(config, f, indent=2)
+    print('Configuration updated successfully')
+except Exception as e:
+    print(f'Error updating config: {e}', file=sys.stderr)
+    sys.exit(1)
+"
+    fi
+fi
+
 echo "CCMaster v${VERSION} setup complete!"
 echo ""
 echo "Usage:"
