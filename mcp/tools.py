@@ -422,10 +422,12 @@ class SessionTools:
                     # Log session start event
                     self.ccmaster.log_event(session_id, 'SESSION_START', f'MCP session started in {working_dir}', display=False)
                     
-                    # Set up monitoring threads
+                    # Set up monitoring threads - use simple_monitor_session for multi-session compatibility
+                    import time
+                    launch_time = time.time()
                     monitor_thread = threading.Thread(
-                        target=self.ccmaster.monitor_session,
-                        args=(session_id,),
+                        target=self.ccmaster.simple_monitor_session,
+                        args=(session_id, launch_time),
                         name=f"Monitor-{session_id}",
                         daemon=True
                     )

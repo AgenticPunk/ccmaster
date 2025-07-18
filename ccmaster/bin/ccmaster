@@ -1181,9 +1181,33 @@ class CCMaster:
                 except queue.Empty:
                     pass
                 
-                # Handle auto-continue for ALL active sessions (including MCP-created ones)
+                # Check for session terminations and handle auto-continue for ALL active sessions (including MCP-created ones)
                 for check_session_id in list(self.active_sessions.keys()):
                     if check_session_id not in self.current_status:
+                        continue
+                    
+                    # First check if terminal window is still open
+                    if not self.is_terminal_window_open(check_session_id):
+                        prefix = self.get_session_prefix(check_session_id)
+                        self.cli_log('Terminal window closed', log_type='end', prefix=prefix, newline_before=True)
+                        # Update session status
+                        if check_session_id in self.sessions:
+                            self.sessions[check_session_id]['status'] = 'ended'
+                            self.sessions[check_session_id]['ended_at'] = datetime.now().isoformat()
+                            self.save_sessions()
+                        # Remove from active sessions
+                        del self.active_sessions[check_session_id]
+                        # Clean up session tracking
+                        if check_session_id in self.watch_modes:
+                            del self.watch_modes[check_session_id]
+                        if check_session_id in self.current_status:
+                            del self.current_status[check_session_id]
+                        if check_session_id in self.auto_continue_counts:
+                            del self.auto_continue_counts[check_session_id]
+                        if check_session_id in self.has_seen_first_prompt:
+                            del self.has_seen_first_prompt[check_session_id]
+                        if check_session_id in last_idle_time:
+                            del last_idle_time[check_session_id]
                         continue
                     
                     # Get session-specific watch mode and status
@@ -1303,6 +1327,33 @@ class CCMaster:
                 tty.setraw(sys.stdin.fileno())
     
     # thread_safe_print method removed - all printing now goes through cli_log
+    
+    def is_terminal_window_open(self, session_id):
+        """Check if the Terminal window for this session is still open"""
+        if session_id not in self.sessions or 'terminal_window_id' not in self.sessions[session_id]:
+            return True  # If we don't have window info, assume it's open
+        
+        window_id = self.sessions[session_id]['terminal_window_id']
+        
+        # AppleScript to check if window exists
+        check_script = f'''
+        tell application "Terminal"
+            try
+                set w to window id {window_id}
+                return "exists"
+            on error
+                return "not_found"
+            end try
+        end tell
+        '''
+        
+        try:
+            result = subprocess.run(['osascript', '-e', check_script], capture_output=True, text=True)
+            if result.returncode == 0:
+                return result.stdout.strip() == "exists"
+            return False
+        except Exception:
+            return True  # If we can't check, assume it's still open
     
     def cli_log(self, message, log_type='info', prefix='', color=None, newline_before=False, session_id=None):
         """
