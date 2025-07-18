@@ -816,6 +816,9 @@ class CCMaster:
                     self.sessions[session_id]['status'] = 'ended'
                     self.sessions[session_id]['ended_at'] = datetime.now().isoformat()
                     self.save_sessions()
+                    # Remove from active sessions to avoid CLI exit
+                    if session_id in self.active_sessions:
+                        del self.active_sessions[session_id]
                     self.log_event(session_id, 'SESSION_END', 'Claude session ended (terminal window closed)')
                     break
                 
@@ -832,6 +835,9 @@ class CCMaster:
                         self.sessions[session_id]['status'] = 'ended'
                         self.sessions[session_id]['ended_at'] = datetime.now().isoformat()
                         self.save_sessions()
+                        # Remove from active sessions to avoid CLI exit
+                        if session_id in self.active_sessions:
+                            del self.active_sessions[session_id]
                         self.log_event(session_id, 'SESSION_END', 'Claude session ended (process not found)')
                         break
                 
@@ -1164,7 +1170,7 @@ class CCMaster:
                             
                         elif event_type == 'SESSION_END':
                             self.cli_log(message, log_type='end', prefix=prefix, newline_before=True)
-                            self.should_stop = True
+                            # Don't stop CLI - let the session removal logic handle it
                             
                         elif event_type == 'LAUNCH':
                             self.cli_log(message, log_type='launch', prefix=prefix)
@@ -1255,8 +1261,13 @@ class CCMaster:
                                 if check_session_id in last_idle_time:
                                     del last_idle_time[check_session_id]
                 
-                # Break if session should stop
+                # Only break if user requested stop or no sessions remain
                 if self.should_stop:
+                    break
+                
+                # Stop if no active sessions remain
+                if not self.active_sessions:
+                    self.cli_log("All sessions ended. Exiting...", log_type='end', newline_before=True)
                     break
                 
                 # Small sleep to prevent busy-waiting
