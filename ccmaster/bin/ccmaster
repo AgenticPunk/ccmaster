@@ -3,7 +3,11 @@
 CCMaster - Claude Code Session Manager
 
 A tool to manage and monitor Claude Code sessions with automatic continuation capabilities.
+
+Version: 2.0.0
 """
+
+__version__ = "2.0.0"
 
 import argparse
 import json
@@ -1327,6 +1331,9 @@ def main():
     prompts_parser = subparsers.add_parser('prompts', help='View user prompts for a session')
     prompts_parser.add_argument('session_id', help='Session ID')
     
+    # Version command
+    version_parser = subparsers.add_parser('version', help='Show CCMaster version')
+    
     args = parser.parse_args()
     
     cc = CCMaster()
@@ -1349,6 +1356,10 @@ def main():
         cc.view_logs(args.session_id)
     elif args.command == 'prompts':
         cc.view_prompts(args.session_id)
+    elif args.command == 'version':
+        print(f"CCMaster version {__version__}")
+        print(f"⟐ Claude Code Session Manager")
+        print(f"◆ https://github.com/yourusername/ccmaster")
 
 if __name__ == '__main__':
     main()
