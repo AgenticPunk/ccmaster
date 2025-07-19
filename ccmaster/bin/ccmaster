@@ -87,6 +87,7 @@ class CCMaster:
         self.auto_continue_counts = {}  # session_id -> count
         self.max_turns = {}  # session_id -> max_turns
         self.has_seen_first_prompt = {}  # session_id -> bool
+        self.pending_continues = {}  # session_id -> bool (prevent duplicate auto-continues)
         
         # Thread-safe printing
         self.print_lock = threading.Lock()
@@ -161,7 +162,7 @@ class CCMaster:
                     s.bind((self.mcp_host, port))
                     s.close()
                     if port != base_port:
-                        self.cli_log(f"Port {base_port} was busy, using {port} instead", log_type='info')
+                        self.cli_log(f"MCP: Port {base_port} busy, using {port}", log_type='info')
                     return port
                 except OSError:
                     continue
@@ -185,8 +186,7 @@ class CCMaster:
         # Check if MCP module is available
         if MCPServer is None:
             self.logger.warning("MCP module not available")
-            self.cli_log("Warning: MCP module not found. MCP features will be disabled.", log_type='warning')
-            self.cli_log(f"  Looked in: {os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))}", log_type='info')
+            self.cli_log("MCP features disabled (module not found)", log_type='warning')
             self.mcp_enabled = False
             return
             
@@ -195,7 +195,7 @@ class CCMaster:
             import requests
         except ImportError:
             self.logger.error("requests module not found - required for MCP")
-            self.cli_log("MCP requires the 'requests' module. Install with: pip install requests", log_type='warning')
+            self.cli_log("MCP disabled: pip install requests", log_type='warning')
             self.mcp_enabled = False
             return
             
@@ -205,9 +205,7 @@ class CCMaster:
         if not self.mcp_port:
             base_port = self.config.get('mcp', {}).get('port', 8181)
             self.logger.error(f"No available ports found starting from {base_port}")
-            self.cli_log(f"No available MCP ports found (tried {base_port} to {base_port + 9})", log_type='warning')
-            self.cli_log("Check if other processes are using these ports", log_type='info')
-            self.cli_log("You can change the base port in ~/.ccmaster/config.json", log_type='info')
+            self.cli_log(f"MCP ports {base_port}-{base_port + 9} busy", log_type='warning')
             self.mcp_enabled = False
             return
         
@@ -216,11 +214,10 @@ class CCMaster:
             if self.mcp_server.start():
                 self.save_mcp_port(self.mcp_port)
                 self.logger.info(f"MCP server started on {self.mcp_host}:{self.mcp_port}")
-                self.cli_log(f"MCP server started on {self.mcp_host}:{self.mcp_port}", log_type='launch', color=Colors.GREEN)
+                self.cli_log(f"MCP server: {self.mcp_host}:{self.mcp_port}", log_type='launch', color=Colors.GREEN)
             else:
                 self.logger.error(f"Failed to start MCP server on port {self.mcp_port}")
-                self.cli_log(f"Failed to start MCP server on port {self.mcp_port}", log_type='warning')
-                self.cli_log("Check ~/.ccmaster/logs/ for details", log_type='info')
+                self.cli_log(f"MCP server failed", log_type='warning')
                 self.mcp_enabled = False
         except Exception as e:
             self.logger.error(f"MCP server initialization error: {e}")
@@ -232,8 +229,9 @@ class CCMaster:
     def stop_mcp_server(self):
         """Stop MCP server"""
         if self.mcp_server:
+            # Don't log here - let the MCP server handle its own shutdown logging
             self.mcp_server.stop()
-            self.logger.info("MCP server stopped")
+            self.mcp_server = None
     
     def create_project_mcp_config(self, working_dir):
         """Add CCMaster MCP server to Claude Code using 'claude mcp add' command"""
@@ -288,10 +286,7 @@ class CCMaster:
             result = subprocess.run(mcp_add_cmd, capture_output=True, text=True, cwd=working_dir)
             
             if result.returncode == 0:
-                self.cli_log("Added CCMaster MCP server to Claude Code", log_type='info', color=Colors.GREEN)
-                self.cli_log("Server: ccmaster (project scope)", log_type='info')
-                self.cli_log(f"Port: {self.mcp_port}", log_type='info')
-                self.cli_log(f"MCP tools will be available as: /mcp__ccmaster__<tool>", log_type='info', color=Colors.BLUE)
+                self.cli_log(f"MCP enabled: /mcp__ccmaster__*", log_type='info', color=Colors.GREEN)
                 
                 self.logger.info(f"Successfully added CCMaster MCP server via 'claude mcp add'")
                 
@@ -304,9 +299,9 @@ class CCMaster:
                 # Check if .mcp.json was created
                 mcp_json_path = os.path.join(working_dir, '.mcp.json')
                 if os.path.exists(mcp_json_path):
-                    self.cli_log(f"✓ Created .mcp.json in {working_dir}", log_type='info', color=Colors.GREEN)
+                    self.cli_log(f"✓ .mcp.json created", log_type='info', color=Colors.GREEN)
                 else:
-                    self.cli_log(f"Warning: .mcp.json not found in {working_dir}", log_type='warning')
+                    self.cli_log(f".mcp.json not found", log_type='warning')
                 
                 # Small delay to ensure file is written
                 time.sleep(0.5)
@@ -316,7 +311,7 @@ class CCMaster:
                     try:
                         with open(mcp_json_path, 'r') as f:
                             mcp_content = json.load(f)
-                            self.cli_log(f"✓ Verified .mcp.json content: {len(mcp_content.get('mcpServers', {}))} servers", log_type='info', color=Colors.GREEN)
+                            self.cli_log(f"✓ .mcp.json: {len(mcp_content.get('mcpServers', {}))} servers", log_type='info', color=Colors.GREEN)
                     except Exception as e:
                         self.cli_log(f"Error reading .mcp.json: {e}", log_type='warning')
             else:
@@ -346,7 +341,6 @@ class CCMaster:
             # Create .claude directory if it doesn't exist
             if not os.path.exists(claude_dir):
                 os.makedirs(claude_dir)
-                self.cli_log("✓ Created .claude directory", log_type='info', color=Colors.GREEN)
             
             # Create settings to auto-enable MCP servers
             settings = {
@@ -376,7 +370,6 @@ class CCMaster:
             with open(settings_file, 'w') as f:
                 json.dump(settings, f, indent=2)
             
-            self.cli_log("✓ Created Claude settings to auto-enable MCP", log_type='info', color=Colors.GREEN)
             self.logger.info(f"Created Claude settings in {settings_file}")
             
         except Exception as e:
@@ -720,7 +713,7 @@ class CCMaster:
                             self.log_event(session_id, 'SESSION_END', 'Claude session ended (PID not found)')
                             break
                 
-                time.sleep(2)  # Check every 2 seconds
+                time.sleep(0.5)  # Check every 0.5 seconds
                 
             except Exception as e:
                 self.log_event(session_id, 'ERROR', f'Monitoring error: {str(e)}')
@@ -847,7 +840,7 @@ class CCMaster:
                         self.log_event(session_id, 'SESSION_END', 'Claude session ended (process not found)')
                         break
                 
-                time.sleep(2)  # Check every 2 seconds
+                time.sleep(0.5)  # Check every 0.5 seconds
                 
             except Exception as e:
                 self.log_event(session_id, 'ERROR', f'Monitoring error: {str(e)}')
@@ -988,36 +981,30 @@ class CCMaster:
         if max_turns:
             self.max_turns[session_id] = max_turns
         
-        # Print session info
-        self.cli_log(f"Starting Claude session in {working_dir}", log_type='launch')
-        self.cli_log(f"Session ID: {session_id}", log_type='info')
+        # Print session info  
+        watch_info = ""
         if watch_mode:
+            watch_info = f" (watch: ON"
             if max_turns:
-                self.cli_log("Watch mode: ON - Will auto-continue after idle", log_type='info', color=Colors.GREEN)
-            else:
-                self.cli_log("Watch mode: ON - Will auto-continue after idle", log_type='info', color=Colors.GREEN)
+                watch_info += f", max: {max_turns}"
+            watch_info += ")"
         else:
-            self.cli_log("Watch mode: OFF - Press [w] to toggle", log_type='info')
+            watch_info = " (watch: OFF)"
+        self.cli_log(f"Starting {session_id}{watch_info}", log_type='launch')
         
         self.log_event(session_id, 'SESSION_START', f'Starting in {working_dir}', display=False)
         
         # Initialize MCP server if not already started
         if self.mcp_enabled and not self.mcp_server:
-            self.cli_log("Initializing MCP server...", log_type='info', color=Colors.PURPLE)
+            self.cli_log("MCP: Starting server...", log_type='info')
             self.init_mcp_server()
         
         # Create project-scoped MCP configuration
         if self.mcp_enabled and self.mcp_server:
-            self.cli_log(f"Creating MCP configuration in {working_dir}", log_type='info', color=Colors.PURPLE)
             self.create_project_mcp_config(working_dir)
             
             # Create Claude settings to auto-enable MCP
             self.create_claude_settings(working_dir)
-        else:
-            if not self.mcp_enabled:
-                self.cli_log("MCP is disabled", log_type='warning')
-            elif not self.mcp_server:
-                self.cli_log("MCP server failed to start", log_type='warning')
         
         # Create per-session hooks configuration
         settings_file, backup_file = self.create_hooks_config(session_id)
@@ -1095,7 +1082,6 @@ class CCMaster:
         
         # Initial status
         current_status_display = self.format_status_line('idle')
-        last_idle_time = {}
         
         # Initialize current_status for this session
         if isinstance(self.current_status, dict):
@@ -1136,20 +1122,25 @@ class CCMaster:
                         if max_turns:
                             current_count = self.auto_continue_counts.get(session_id, 0)
                             remaining = max_turns - current_count
-                            self.cli_log(f"Watch mode: ON - Will auto-continue after idle ({remaining} turns left)", log_type='info', prefix=prefix, color=Colors.GREEN)
+                            self.cli_log(f"Watch: ON ({remaining} left)", log_type='info', prefix=prefix, color=Colors.GREEN)
                         else:
-                            self.cli_log("Watch mode: ON - Will auto-continue after idle", log_type='info', prefix=prefix, color=Colors.GREEN)
+                            self.cli_log("Watch: ON", log_type='info', prefix=prefix, color=Colors.GREEN)
                         
-                        # If we're currently idle and re-enabling after max turns, set idle time for delayed continue
+                        # If we're currently idle and re-enabling after max turns, immediately continue
                         current_session_status = self.current_status.get(session_id) if isinstance(self.current_status, dict) else self.current_status
                         if was_at_max_turns and current_session_status == 'idle':
-                            # Set idle time to trigger auto-continue after delay
-                            last_idle_time[session_id] = time.time()
+                            # Mark as pending and send continue
+                            self.pending_continues[session_id] = True
+                            if self.send_continue_to_claude(session_id):
+                                self.auto_continue_counts[session_id] = self.auto_continue_counts.get(session_id, 0) + 1
+                                prefix = self.get_session_prefix(session_id)
+                                if max_turns:
+                                    self.cli_log(f"Auto-continue ({self.auto_continue_counts[session_id]}/{max_turns})", log_type='auto_continue', prefix=prefix)
+                                else:
+                                    self.cli_log("Auto-continue", log_type='auto_continue', prefix=prefix)
                     else:
                         prefix = self.get_session_prefix(session_id)
-                        self.cli_log("Watch mode: OFF", log_type='info', prefix=prefix)
-                        # Reset idle time tracking
-                        last_idle_time.clear()
+                        self.cli_log("Watch: OFF", log_type='info', prefix=prefix)
                 
                 # Process messages from queue
                 try:
@@ -1173,13 +1164,14 @@ class CCMaster:
                             elif 'Processing' in message:
                                 self.current_status[session_id_from_msg] = 'processing'
                                 self.cli_log(self.format_status_line('processing'), log_type='status_processing', prefix=prefix)
+                                # Clear pending continue since we're now processing
+                                if session_id_from_msg in self.pending_continues:
+                                    del self.pending_continues[session_id_from_msg]
                             elif 'Thinking' in message:
                                 self.current_status[session_id_from_msg] = 'thinking'
                                 self.cli_log(self.format_status_line('thinking'), log_type='status_thinking', prefix=prefix)
                             elif 'Idle' in message:
                                 self.current_status[session_id_from_msg] = 'idle'
-                                # Record when this session became idle for auto-continue delay
-                                last_idle_time[session_id_from_msg] = time.time()
                                 self.cli_log(self.format_status_line('idle'), log_type='status_idle', prefix=prefix)
                             
                         elif event_type == 'USER':
@@ -1188,9 +1180,6 @@ class CCMaster:
                             prompt_preview = prompt_preview.replace('\n', ' ')
                             self.cli_log(f"User: \"{prompt_preview}\"", log_type='user', prefix=prefix)
                             self.has_seen_first_prompt[session_id_from_msg] = True
-                            # Reset idle time when user types
-                            if session_id_from_msg in last_idle_time:
-                                del last_idle_time[session_id_from_msg]
                             
                         elif event_type == 'SESSION_END':
                             self.cli_log(message, log_type='end', prefix=prefix, newline_before=True)
@@ -1236,8 +1225,8 @@ class CCMaster:
                             del self.auto_continue_counts[check_session_id]
                         if check_session_id in self.has_seen_first_prompt:
                             del self.has_seen_first_prompt[check_session_id]
-                        if check_session_id in last_idle_time:
-                            del last_idle_time[check_session_id]
+                        if check_session_id in self.pending_continues:
+                            del self.pending_continues[check_session_id]
                         continue
                     
                     # Get session-specific watch mode and status
@@ -1245,45 +1234,41 @@ class CCMaster:
                     session_first_prompt = self.has_seen_first_prompt.get(check_session_id, False)
                     session_idle = self.current_status.get(check_session_id) == 'idle'
                     
-                    # Handle auto-continue for each idle session with delay
+                    # Handle auto-continue for each idle session
                     if session_watch_mode and session_idle and session_first_prompt:
-                        # Check if session has been idle long enough (2 seconds delay)
-                        idle_time = last_idle_time.get(check_session_id, 0)
-                        if idle_time > 0 and time.time() - idle_time >= 2.0:
-                            session_max_turns = self.max_turns.get(check_session_id)
-                            session_count = self.auto_continue_counts.get(check_session_id, 0)
-                            
-                            if session_max_turns is None or session_count < session_max_turns:
-                                # Send continue to this specific session
-                                if self.send_continue_to_claude(check_session_id):
-                                    self.auto_continue_counts[check_session_id] = session_count + 1
+                            # Check if we already have a pending continue for this session
+                            if check_session_id not in self.pending_continues:
+                                session_max_turns = self.max_turns.get(check_session_id)
+                                session_count = self.auto_continue_counts.get(check_session_id, 0)
+                                
+                                if session_max_turns is None or session_count < session_max_turns:
+                                    # Mark as pending before sending
+                                    self.pending_continues[check_session_id] = True
                                     
-                                    # Clear idle time to prevent immediate re-trigger
-                                    if check_session_id in last_idle_time:
-                                        del last_idle_time[check_session_id]
+                                    # Send continue to this specific session
+                                    if self.send_continue_to_claude(check_session_id):
+                                        self.auto_continue_counts[check_session_id] = session_count + 1
                                     
-                                    # Log with session prefix
+                                        # Log with session prefix
+                                        prefix = self.get_session_prefix(check_session_id)
+                                        
+                                        if session_max_turns:
+                                            msg = f"Auto-continue ({session_count + 1}/{session_max_turns})"
+                                        else:
+                                            msg = f"Auto-continue"
+                                        
+                                        if prefix:
+                                            self.cli_log(msg, log_type='auto_continue', prefix=prefix, color=Colors.GREEN)
+                                        else:
+                                            self.cli_log(msg, log_type='auto_continue', color=Colors.GREEN)
+                                        
+                                        self.log_event(check_session_id, 'AUTO_CONTINUE', f'Sent auto-continue #{session_count + 1}', display=False)
+                                else:
+                                    # Max turns reached, disable watch mode for this session
+                                    self.watch_modes[check_session_id] = False
                                     prefix = self.get_session_prefix(check_session_id)
-                                    
-                                    if session_max_turns:
-                                        msg = f"Auto-continue ({session_count + 1}/{session_max_turns})"
-                                    else:
-                                        msg = f"Auto-continue"
-                                    
-                                    if prefix:
-                                        self.cli_log(msg, log_type='auto_continue', prefix=prefix, color=Colors.GREEN)
-                                    else:
-                                        self.cli_log(msg, log_type='auto_continue', color=Colors.GREEN)
-                                    
-                                    self.log_event(check_session_id, 'AUTO_CONTINUE', f'Sent auto-continue #{session_count + 1}', display=False)
-                            else:
-                                # Max turns reached, disable watch mode for this session
-                                self.watch_modes[check_session_id] = False
-                                prefix = self.get_session_prefix(check_session_id)
-                                self.cli_log(f"Max auto-continue turns ({session_max_turns}) reached - Watch mode disabled", log_type='warning', prefix=prefix)
-                                self.cli_log("Press [w] to re-enable and continue", log_type='info', prefix=prefix)
-                                if check_session_id in last_idle_time:
-                                    del last_idle_time[check_session_id]
+                                    self.cli_log(f"Max turns ({session_max_turns}) reached - watch disabled", log_type='warning', prefix=prefix)
+                                    self.cli_log("Press [w] to re-enable", log_type='info', prefix=prefix)
                 
                 # Only break if user requested stop or no sessions remain
                 if self.should_stop:
@@ -1312,6 +1297,10 @@ class CCMaster:
             
             # Restore original hooks configuration
             self.restore_hooks_config(session_id)
+            
+            # Stop MCP server after all cleanup is done
+            if self.mcp_server:
+                self.stop_mcp_server()
     
     def check_keyboard_input(self):
         """Check for keyboard input without blocking"""
@@ -2331,14 +2320,15 @@ class CCMaster:
         else:
             working_dir = os.path.abspath(working_dir)
         
-        self.cli_log(f"Starting {num_instances} Claude sessions in {working_dir}", log_type='launch')
+        watch_info = ""
         if watch_mode:
+            watch_info = f" (watch: ON"
             if max_turns:
-                self.cli_log(f"Watch mode: ON - Will auto-continue after idle (max {max_turns} turns per session)", log_type='info', color=Colors.GREEN)
-            else:
-                self.cli_log("Watch mode: ON - Will auto-continue after idle", log_type='info', color=Colors.GREEN)
+                watch_info += f", max: {max_turns}"
+            watch_info += ")"
         else:
-            self.cli_log("Watch mode: OFF - Press [w] to toggle for all sessions", log_type='info')
+            watch_info = " (watch: OFF)"
+        self.cli_log(f"Starting {num_instances} sessions{watch_info}", log_type='launch')
         
         # Create all sessions
         session_ids = []
@@ -2358,9 +2348,9 @@ class CCMaster:
             
             # Add MCP indicator for MCP-created sessions
             if session_id.startswith('mcp_'):
-                self.cli_log(f"Session ID: {session_id}", log_type='info', prefix=f"[MCP-{i+1}]")
+                self.cli_log(f"Session: {session_id}", log_type='info', prefix=f"[MCP-{i+1}]")
             else:
-                self.cli_log(f"Session ID: {session_id}", log_type='info', prefix=f"[{i+1}]")
+                self.cli_log(f"Session: {session_id}", log_type='info', prefix=f"[{i+1}]")
             self.log_event(session_id, 'SESSION_START', f'Starting session {i+1} of {num_instances} in {working_dir}', display=False)
         
         # Launch all sessions with slight delay between each
@@ -2436,8 +2426,7 @@ class CCMaster:
             if i < num_instances - 1:
                 time.sleep(1)
         
-        self.cli_log("All sessions launched. Monitoring...", log_type='launch', newline_before=True)
-        self.cli_log("Press [q] to quit, [w] to toggle watch mode for all sessions", log_type='info', newline_before=True)
+        self.cli_log(f"All {num_instances} sessions launched. Press [q] to quit, [w] to toggle watch", log_type='launch', newline_before=True)
         
         # Message printer thread for multi-agent
         printer_thread = threading.Thread(
@@ -2470,9 +2459,9 @@ class CCMaster:
                             self.auto_continue_counts[sid] = 0
                     
                     if new_watch_mode:
-                        self.cli_log("Watch mode: ON for all sessions", log_type='info', color=Colors.GREEN, newline_before=True)
+                        self.cli_log("Watch: ON (all sessions)", log_type='info', color=Colors.GREEN, newline_before=True)
                     else:
-                        self.cli_log("Watch mode: OFF for all sessions", log_type='info', newline_before=True)
+                        self.cli_log("Watch: OFF (all sessions)", log_type='info', newline_before=True)
                 
                 # Check session statuses and handle auto-continue
                 for session_id in list(self.active_sessions.keys()):
@@ -2490,12 +2479,16 @@ class CCMaster:
                     if (self.watch_modes.get(session_id, False) and 
                         self.current_status.get(session_id) == 'idle' and
                         self.has_seen_first_prompt.get(session_id, False) and
-                        session_id in self.active_sessions):
+                        session_id in self.active_sessions and
+                        session_id not in self.pending_continues):
                         
                         max_t = self.max_turns.get(session_id)
                         count = self.auto_continue_counts.get(session_id, 0)
                         
                         if max_t is None or count < max_t:
+                            # Mark as pending before sending
+                            self.pending_continues[session_id] = True
+                            
                             # Send continue to this specific session
                             if self.send_continue_to_claude(session_id):
                                 self.auto_continue_counts[session_id] = count + 1
@@ -2504,7 +2497,7 @@ class CCMaster:
                                                       f'Auto-continue ({count + 1}/{max_t if max_t else "∞"})'))
                 
                 # Small sleep to prevent busy-waiting
-                time.sleep(2)
+                time.sleep(0.1)
                 
         except KeyboardInterrupt:
             self.cli_log("Sessions interrupted by user", log_type='end', newline_before=True)
@@ -2522,6 +2515,10 @@ class CCMaster:
                 
                 # Restore original hooks configuration
                 self.restore_hooks_config(session_id)
+            
+            # Stop MCP server after all cleanup is done
+            if self.mcp_server:
+                self.stop_mcp_server()
     
     def multi_session_message_printer(self):
         """Print messages for multiple concurrent sessions"""
@@ -2556,6 +2553,9 @@ class CCMaster:
                         elif 'Processing' in message:
                             status = 'processing'
                             tool = None
+                            # Clear pending continue since we're now processing
+                            if session_id in self.pending_continues:
+                                del self.pending_continues[session_id]
                         elif 'Thinking' in message:
                             status = 'thinking'
                             tool = None
@@ -3414,16 +3414,13 @@ def main():
     
     cc = CCMaster()
     
-    # Cleanup function
+    # Cleanup function (not using atexit to avoid duplicate messages)
     def cleanup():
-        cc.stop_mcp_server()
+        if cc.mcp_server:
+            cc.stop_mcp_server()
         cc.should_stop = True
         # Kill all active Claude sessions on exit
         cc.kill_all_active_sessions()
-    
-    # Register cleanup for graceful shutdown
-    import atexit
-    atexit.register(cleanup)
     
     # Default to 'start' if no command specified
     if args.command is None:
@@ -3460,7 +3457,8 @@ def main():
         elif args.command == 'pm':
             cc.start_pm_mode(args.prompt, args.dir, not args.no_watch, args.pm_template)
     finally:
-        cleanup()
+        # Cleanup is handled by atexit, don't call it again here
+        pass
 
 if __name__ == '__main__':
     try:

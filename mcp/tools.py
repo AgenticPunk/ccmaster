@@ -411,11 +411,11 @@ class SessionTools:
             self.ccmaster.has_seen_first_prompt[session_id] = False
             
             # Log the session creation
-            self.ccmaster.cli_log(f"Creating MCP session: {session_id}", log_type='info', color='PURPLE')
-            self.ccmaster.cli_log(f"Working directory: {working_dir}", log_type='info')
-            self.ccmaster.cli_log(f"Watch mode: {'ON' if watch_mode else 'OFF'}", log_type='info')
+            watch_info = f" (watch: {'ON' if watch_mode else 'OFF'}"
             if max_turns:
-                self.ccmaster.cli_log(f"Max auto-continues: {max_turns}", log_type='info')
+                watch_info += f", max: {max_turns}"
+            watch_info += ")"
+            self.ccmaster.cli_log(f"Creating {session_id}{watch_info}", log_type='info', color='PURPLE')
             
             # Start the actual Claude session in a separate thread
             import threading
@@ -439,7 +439,7 @@ class SessionTools:
                     env['CLAUDE_CODE_USER_SETTINGS_FILE'] = settings_file
                     env['CCMASTER_SESSION_ID'] = session_id
                     
-                    self.ccmaster.cli_log(f"Launching Claude Code in: {working_dir}", log_type='info')
+                    # Launch Claude Code (remove verbose directory message)
                     
                     # Try iTerm first, then fall back to Terminal
                     # Check if iTerm is available
@@ -479,7 +479,6 @@ class SessionTools:
                     if result.returncode == 0:
                         # Parse window info
                         window_info = result.stdout.strip()
-                        self.ccmaster.cli_log(f"AppleScript output: '{window_info}'", log_type='info')
                         if window_info:
                             # Handle both comma-space and comma formats
                             if ', ' in window_info:
@@ -493,12 +492,11 @@ class SessionTools:
                                 # Store terminal window info for auto-continue
                                 self.ccmaster.sessions[session_id]['terminal_window_id'] = int(window_id)
                                 self.ccmaster.sessions[session_id]['terminal_tab_index'] = int(tab_id)
-                                self.ccmaster.cli_log(f"Stored terminal info - Window: {window_id}, Tab: {tab_id}", log_type='info')
-                                self.ccmaster.cli_log(f"Launched Claude in Terminal (Window: {window_id}, Tab: {tab_id})", log_type='launch')
+                                self.ccmaster.cli_log(f"Launched Claude (W{window_id}/T{tab_id})", log_type='launch')
                             else:
-                                self.ccmaster.cli_log(f"Invalid window info format: '{window_info}'", log_type='warning')
+                                self.ccmaster.cli_log(f"Invalid window info: '{window_info}'", log_type='warning')
                         else:
-                            self.ccmaster.cli_log("No terminal window info returned from AppleScript", log_type='warning')
+                            self.ccmaster.cli_log("No window info from AppleScript", log_type='warning')
                     else:
                         self.ccmaster.cli_log(f"AppleScript failed (return code {result.returncode}): {result.stderr.strip()}", log_type='error')
                     
@@ -726,23 +724,34 @@ Please acknowledge and begin working on your assigned subtask.
     def prompt(self, message: str) -> Dict[str, Any]:
         """Demo tool: Display a prompt message in CCMaster console"""
         try:
-            timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            # Process message to handle newlines properly
+            # Split multiline messages and print each line with proper alignment
+            lines = message.strip().split('\n')
             
             # Use CCMaster's standardized cli_log if available
             if hasattr(self.ccmaster, 'cli_log'):
-                self.ccmaster.cli_log(message, log_type='mcp', newline_before=True)
+                # Print first line with newline before
+                self.ccmaster.cli_log(lines[0], log_type='mcp', newline_before=True)
+                # Print remaining lines with proper indentation
+                for line in lines[1:]:
+                    # Clean up extra whitespace but preserve intended formatting
+                    cleaned_line = line.strip()
+                    if cleaned_line:  # Only print non-empty lines
+                        self.ccmaster.cli_log(cleaned_line, log_type='mcp')
             else:
                 # Fallback to direct printing if cli_log not available
-                print(f"\n\033[96m[MCP] {timestamp} - {message}\033[0m")
+                timestamp = datetime.now().strftime("%H:%M:%S")
+                print()  # Newline before
+                for line in lines:
+                    cleaned_line = line.strip()
+                    if cleaned_line:
+                        print(f"[{timestamp}] [MCP] {cleaned_line}")
                 sys.stdout.flush()
-            
-            # Don't log to file logger to avoid console output misalignment
-            # The message is already displayed in cyan on the console
             
             return {
                 "success": True,
                 "message": "Prompt displayed in CCMaster console",
-                "timestamp": timestamp,
+                "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
                 "prompt_text": message
             }
             
