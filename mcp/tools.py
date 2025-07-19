@@ -29,7 +29,11 @@ class SessionTools:
             "spawn_temp_session": self.spawn_temp_session,
             "coordinate_sessions": self.coordinate_sessions,
             "get_session_logs": self.get_session_logs,
-            "prompt": self.prompt
+            "prompt": self.prompt,
+            "get_team_info": self.get_team_info,
+            "broadcast_to_team": self.broadcast_to_team,
+            "wait_for_dependency": self.wait_for_dependency,
+            "notify_completion": self.notify_completion
         }
     
     def get_tool_definitions(self) -> List[Dict[str, Any]]:
@@ -104,6 +108,14 @@ class SessionTools:
                         "max_turns": {
                             "type": "integer",
                             "description": "Maximum auto-continue turns"
+                        },
+                        "initial_prompt": {
+                            "type": "string",
+                            "description": "Initial prompt to send to the new session"
+                        },
+                        "role": {
+                            "type": "string",
+                            "description": "Role of this team member (e.g., 'Frontend Developer', 'Backend Developer')"
                         }
                     }
                 }
@@ -195,6 +207,82 @@ class SessionTools:
                     },
                     "required": ["message"]
                 }
+            },
+            {
+                "name": "get_team_info",
+                "description": "Get information about all team members (sessions) including their roles and status",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {}
+                }
+            },
+            {
+                "name": "broadcast_to_team",
+                "description": "Broadcast a message to all active team members",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "message": {
+                            "type": "string",
+                            "description": "Message to broadcast to all team members"
+                        },
+                        "sender_role": {
+                            "type": "string",
+                            "description": "Role of the sender (e.g., 'Frontend Developer')"
+                        },
+                        "exclude_session": {
+                            "type": "string",
+                            "description": "Session ID to exclude from broadcast (usually the sender)"
+                        }
+                    },
+                    "required": ["message", "sender_role"]
+                }
+            },
+            {
+                "name": "wait_for_dependency",
+                "description": "Wait for another team member to complete a specific task",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "dependency_session": {
+                            "type": "string",
+                            "description": "Session ID of the team member you're waiting for"
+                        },
+                        "dependency_description": {
+                            "type": "string",
+                            "description": "Description of what you're waiting for"
+                        },
+                        "timeout": {
+                            "type": "integer",
+                            "description": "Maximum time to wait in seconds",
+                            "default": 300
+                        }
+                    },
+                    "required": ["dependency_session", "dependency_description"]
+                }
+            },
+            {
+                "name": "notify_completion",
+                "description": "Notify team members that a specific task or component is completed",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "task_description": {
+                            "type": "string",
+                            "description": "Description of the completed task"
+                        },
+                        "output_details": {
+                            "type": "string",
+                            "description": "Details about the output (files created, APIs available, etc.)"
+                        },
+                        "notify_sessions": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                            "description": "List of session IDs to notify. If empty, notifies all team members"
+                        }
+                    },
+                    "required": ["task_description", "output_details"]
+                }
             }
         ]
     
@@ -248,7 +336,10 @@ class SessionTools:
             return {"error": f"Session {session_id} is not active"}
         
         try:
-            # Send message through CCMaster's existing mechanism
+            # Log the message being sent for debugging
+            self.ccmaster.logger.info(f"Sending message to session {session_id}: {message[:100]}...")
+            
+            # Send message through CCMaster's existing mechanism which now uses file-based approach
             success = self.ccmaster.send_continue_to_claude(session_id, message)
             
             result = {
@@ -260,15 +351,16 @@ class SessionTools:
             
             if wait_for_response:
                 # Wait for session to process the message
-                time.sleep(2)  # Simple wait - could be improved with actual response monitoring
+                time.sleep(3)  # Increased wait time for file-based approach
                 result["session_status"] = self.ccmaster.current_status.get(session_id, 'unknown')
             
             return result
             
         except Exception as e:
+            self.ccmaster.logger.error(f"Error sending message to session {session_id}: {str(e)}")
             return {"error": f"Failed to send message: {str(e)}"}
     
-    def create_session(self, working_dir: str = None, watch_mode: bool = True, max_turns: int = None) -> Dict[str, Any]:
+    def create_session(self, working_dir: str = None, watch_mode: bool = True, max_turns: int = None, initial_prompt: str = None, role: str = None) -> Dict[str, Any]:
         """Create a new Claude Code session"""
         try:
             if working_dir is None:
@@ -292,7 +384,9 @@ class SessionTools:
                 'last_activity': datetime.now().isoformat(),
                 'created_by': 'mcp',
                 'watch_mode': watch_mode,
-                'max_turns': max_turns
+                'max_turns': max_turns,
+                'role': role or 'Team Member',
+                'initial_prompt': initial_prompt
             }
             
             # Register the session with CCMaster
@@ -422,6 +516,19 @@ class SessionTools:
                     
                     # Set up monitoring threads - use simple_monitor_session for multi-session compatibility
                     import time
+                    
+                    # Send initial prompt if provided
+                    if initial_prompt:
+                        # Wait a bit for Claude to fully start
+                        time.sleep(3)
+                        
+                        # Send the initial prompt
+                        self.ccmaster.cli_log(f"Sending initial prompt to {role or 'Team Member'}", log_type='info')
+                        success = self.ccmaster.send_continue_to_claude(session_id, initial_prompt)
+                        if success:
+                            self.ccmaster.cli_log(f"Initial prompt sent successfully", log_type='info', color='\033[92m')  # GREEN
+                        else:
+                            self.ccmaster.cli_log(f"Failed to send initial prompt", log_type='warning')
                     launch_time = time.time()
                     monitor_thread = threading.Thread(
                         target=self.ccmaster.simple_monitor_session,
@@ -464,8 +571,10 @@ class SessionTools:
                 "working_dir": working_dir,
                 "watch_mode": watch_mode,
                 "max_turns": max_turns,
+                "role": role or 'Team Member',
+                "initial_prompt_sent": bool(initial_prompt),
                 "created_at": datetime.now().isoformat(),
-                "message": f"MCP session {session_id} created and being monitored"
+                "message": f"MCP session {session_id} created for {role or 'Team Member'}"
             }
             
         except Exception as e:
@@ -648,3 +757,212 @@ Please acknowledge and begin working on your assigned subtask.
             
         except Exception as e:
             return {"error": f"Failed to display prompt: {str(e)}"}
+    
+    def get_team_info(self) -> Dict[str, Any]:
+        """Get information about all team members including roles and status"""
+        try:
+            team_members = []
+            
+            for session_id, session_data in self.ccmaster.sessions.items():
+                if session_data.get('status') == 'ended':
+                    continue
+                
+                # Get session info with role
+                member_info = {
+                    "session_id": session_id,
+                    "role": session_data.get('role', 'Unknown'),
+                    "status": session_data.get('status', 'unknown'),
+                    "current_state": self.ccmaster.current_status.get(session_id, 'unknown'),
+                    "working_dir": session_data.get('working_dir'),
+                    "created_at": session_data.get('started_at'),
+                    "is_active": session_id in self.ccmaster.active_sessions,
+                    "display_index": self.ccmaster.active_sessions.get(session_id, {}).get('index', 0)
+                }
+                
+                # Add PM indicator
+                if session_data.get('role') == 'Project Manager':
+                    member_info['is_pm'] = True
+                
+                team_members.append(member_info)
+            
+            # Sort by display index
+            team_members.sort(key=lambda x: x.get('display_index', 999))
+            
+            return {
+                "success": True,
+                "team_members": team_members,
+                "total_members": len(team_members),
+                "active_members": len([m for m in team_members if m['is_active']]),
+                "project_directory": os.getcwd()
+            }
+            
+        except Exception as e:
+            return {"error": f"Failed to get team info: {str(e)}"}
+    
+    def broadcast_to_team(self, message: str, sender_role: str, exclude_session: str = None) -> Dict[str, Any]:
+        """Broadcast a message to all active team members"""
+        try:
+            broadcast_results = {}
+            recipients = []
+            
+            # Format broadcast message
+            formatted_message = f"""
+[TEAM BROADCAST from {sender_role}]
+{message}
+[END BROADCAST]
+"""
+            
+            # Send to all active sessions except the sender
+            for session_id in self.ccmaster.active_sessions:
+                if exclude_session and session_id == exclude_session:
+                    continue
+                
+                result = self.send_message_to_session(session_id, formatted_message)
+                broadcast_results[session_id] = result
+                
+                if result.get('success'):
+                    session_data = self.ccmaster.sessions.get(session_id, {})
+                    recipients.append({
+                        "session_id": session_id,
+                        "role": session_data.get('role', 'Unknown')
+                    })
+            
+            # Also log to console for visibility
+            self.ccmaster.cli_log(f"📢 Broadcast from {sender_role}: {message}", log_type='mcp', color='\033[95m')  # PURPLE
+            
+            return {
+                "success": True,
+                "message": "Broadcast sent to team",
+                "sender_role": sender_role,
+                "recipients": recipients,
+                "broadcast_results": broadcast_results
+            }
+            
+        except Exception as e:
+            return {"error": f"Failed to broadcast: {str(e)}"}
+    
+    def wait_for_dependency(self, dependency_session: str, dependency_description: str, timeout: int = 300) -> Dict[str, Any]:
+        """Wait for another team member to complete a task"""
+        try:
+            if dependency_session not in self.ccmaster.sessions:
+                return {"error": f"Dependency session {dependency_session} not found"}
+            
+            dependency_role = self.ccmaster.sessions[dependency_session].get('role', 'Unknown')
+            
+            # Log the waiting status
+            self.ccmaster.cli_log(
+                f"⏳ Waiting for {dependency_role} ({dependency_session}) to complete: {dependency_description}", 
+                log_type='mcp', 
+                color='\033[93m'  # YELLOW
+            )
+            
+            # Send notification to the dependency session
+            notify_msg = f"""
+[DEPENDENCY REQUEST]
+Another team member is waiting for you to complete:
+{dependency_description}
+
+Please prioritize this task if possible.
+"""
+            self.send_message_to_session(dependency_session, notify_msg)
+            
+            # Wait for completion with timeout
+            start_time = time.time()
+            check_interval = 5  # Check every 5 seconds
+            
+            while time.time() - start_time < timeout:
+                # Check if dependency session is still active
+                if dependency_session not in self.ccmaster.active_sessions:
+                    return {
+                        "success": False,
+                        "reason": "dependency_session_ended",
+                        "message": f"{dependency_role} session ended before completing the task"
+                    }
+                
+                # Check status
+                status = self.ccmaster.current_status.get(dependency_session, 'unknown')
+                
+                # Simple heuristic: if idle after being active, might be done
+                # In real implementation, would need better completion detection
+                if status == 'idle':
+                    self.ccmaster.cli_log(
+                        f"✓ {dependency_role} appears to have completed the task", 
+                        log_type='mcp', 
+                        color='\033[92m'  # GREEN
+                    )
+                    
+                    return {
+                        "success": True,
+                        "dependency_session": dependency_session,
+                        "dependency_role": dependency_role,
+                        "wait_time": time.time() - start_time,
+                        "message": "Dependency appears to be completed"
+                    }
+                
+                time.sleep(check_interval)
+            
+            # Timeout reached
+            return {
+                "success": False,
+                "reason": "timeout",
+                "message": f"Timeout waiting for {dependency_role} to complete: {dependency_description}",
+                "wait_time": timeout
+            }
+            
+        except Exception as e:
+            return {"error": f"Failed to wait for dependency: {str(e)}"}
+    
+    def notify_completion(self, task_description: str, output_details: str, notify_sessions: List[str] = None) -> Dict[str, Any]:
+        """Notify team members about task completion"""
+        try:
+            # Get sender info
+            # This would need to be passed or determined from context
+            # For now, we'll include it in the notification
+            
+            notification_msg = f"""
+[TASK COMPLETED]
+Task: {task_description}
+Output: {output_details}
+
+You can now proceed with any tasks that depend on this completion.
+[END NOTIFICATION]
+"""
+            
+            results = {}
+            notified = []
+            
+            # If specific sessions provided, notify only those
+            if notify_sessions:
+                target_sessions = [s for s in notify_sessions if s in self.ccmaster.active_sessions]
+            else:
+                # Notify all active sessions
+                target_sessions = list(self.ccmaster.active_sessions.keys())
+            
+            for session_id in target_sessions:
+                result = self.send_message_to_session(session_id, notification_msg)
+                results[session_id] = result
+                
+                if result.get('success'):
+                    session_data = self.ccmaster.sessions.get(session_id, {})
+                    notified.append({
+                        "session_id": session_id,
+                        "role": session_data.get('role', 'Unknown')
+                    })
+            
+            # Log to console
+            self.ccmaster.cli_log(
+                f"✅ Task Completed: {task_description}", 
+                log_type='mcp', 
+                color='\033[92m'  # GREEN
+            )
+            
+            return {
+                "success": True,
+                "task_description": task_description,
+                "output_details": output_details,
+                "notified_sessions": notified,
+                "notification_results": results
+            }
+            
+        except Exception as e:
+            return {"error": f"Failed to notify completion: {str(e)}"}

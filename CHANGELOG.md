@@ -7,6 +7,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **Session Recovery**: New `ccmaster load` command for resuming previous sessions
+  - Interactive session selector with arrow key navigation
+  - Shows session ID, role, status, working directory, and start time
+  - Press Enter to load and resume sessions
+  - Press 'd' to delete unwanted sessions and their logs
+  - Sessions start fresh without context prompts
+  - **PM Session Recovery**: Loading a PM session automatically resumes all team members
+- **Auto-Close Sessions**: All Claude sessions automatically close when CCMaster exits
+  - Gracefully closes Terminal windows for all active sessions
+  - Updates session statuses to 'ended' on exit
+  - Prevents orphaned Claude processes
+
+### Fixed
+- **Input Method Conflict**: Fixed issue where sending prompts to Claude instances would conflict with input methods
+  - Replaced keystroke-based input with file-based approach using temporary files
+  - All prompts (initial and auto-continue) now use `cat` command to avoid focus switching
+  - Resolves issues with Chinese and other non-ASCII input methods
+  - Affects both regular sessions and MCP-created sessions
+- **Session Loading**: Fixed issue where loading a session would create a new session instead of updating the existing one
+  - Added `monitor_single_session` method to monitor existing sessions without creating new ones
+  - Session IDs are preserved when resuming sessions
+  - PM sessions properly track their team members with `created_by_pm` field
+
 ## [2.0.0] - 2025-01-18
 
 ### Added

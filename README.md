@@ -19,6 +19,14 @@ CCMaster is an intelligent session management tool for Claude Code. It automatic
 - 💬 **Cross-Session Communication**: Send messages and coordinate tasks between sessions
 - 🔄 **Unified Session Management**: All sessions (original + MCP-created) tracked with consistent prefixes
 - 🛡️ **Session Lifecycle Control**: CLI stays alive until all sessions end, proper cleanup on termination
+- 💾 **Session Recovery**: Load and resume previous sessions with full context using `ccmaster load`
+- 🗑️ **Session Management**: Delete unwanted sessions through interactive interface
+- 🔚 **Auto-Close Sessions**: All Claude sessions automatically close when CCMaster exits
+- 🧠 **PM Mode**: Claude analyzes project requirements and creates a truly collaborative team of specialized instances
+- 🤝 **Real Team Collaboration**: All team members work in shared workspace, PM coordinates tasks and monitors progress
+- 📋 **Dynamic Task Assignment**: PM sends specific tasks to team members based on project needs and progress
+- 🔄 **Continuous Team Management**: PM runs indefinitely, coordinating team and responding to new requirements
+- 📈 **Adaptive Team Growth**: Add new requirements anytime - PM creates new specialists AND coordinates with existing team
 
 ## 🛠 Installation
 
@@ -68,8 +76,18 @@ ccmaster watch --instances 2
 # Start 3 Claude sessions with max 50 auto-continues each
 ccmaster watch --instances 3 --maxturn 50
 
+# PM Mode - Claude analyzes project and creates specialized instances
+ccmaster pm "Create an e-commerce platform with React frontend and Node.js backend"
+
+# PM Mode with options
+ccmaster pm "Your project description" --no-watch  # Disable auto-continue
+ccmaster pm "Your project description" --pm-template template.md  # Custom template
+
 # List all sessions
 ccmaster list
+
+# Load and resume a previous session (interactive)
+ccmaster load
 
 # View session logs
 ccmaster logs 20240124_143022
@@ -179,7 +197,10 @@ CCMaster uses a hooks-based architecture to monitor Claude Code:
 
 ### Multi-Agent Architecture
 
-CCMaster supports both pre-planned (`--instances`) and dynamic (MCP-created) session management:
+CCMaster supports three modes of multi-agent creation:
+1. **Pre-planned** (`--instances`) - Create a fixed number of identical sessions
+2. **Dynamic** (MCP tools) - Claude creates new sessions during runtime
+3. **PM Mode** (`pm` command) - Claude analyzes project and creates specialized team
 
 ```
 ┌─────────────┐     ┌──────────────┐     ┌─────────────┐
@@ -203,6 +224,29 @@ Each session (original or MCP-created):
 - Has isolated hook configurations for clean monitoring
 - Can communicate with other sessions via MCP tools
 - Supports dynamic creation during runtime
+
+### Session Recovery & Management
+
+CCMaster provides powerful session recovery features:
+
+```bash
+# Launch the interactive session loader
+ccmaster load
+```
+
+Features:
+- **Interactive Selection**: Navigate through sessions with arrow keys
+- **Session Details**: View ID, role, status, working directory, and start time
+- **Load & Resume**: Press Enter to resume a session with full context
+- **Delete Sessions**: Press 'd' to delete unwanted sessions and their logs
+- **Context Restoration**: Previous prompts are included when resuming
+- **Auto-Close on Exit**: All active Claude sessions close when CCMaster exits
+
+When resuming a session:
+1. Working directory is restored
+2. Claude starts fresh and waits for your input
+3. Full monitoring and watch mode support
+4. **PM Sessions**: Automatically resumes all team members together
 
 ### Key Components
 
@@ -304,15 +348,53 @@ CCMaster provides comprehensive session management tools within Claude:
 
 ### Advanced Multi-Agent Workflows
 
-**1. Dynamic Session Creation**
+**1. PM Mode - True Team Collaboration**
 ```bash
-# Claude can create specialized sessions on demand:
-/mcp__ccmaster__create_session working_dir="/frontend" watch_mode=true
-/mcp__ccmaster__create_session working_dir="/backend" watch_mode=true
-/mcp__ccmaster__create_session working_dir="/docs" watch_mode=false max_turns=1
+# Let Claude analyze and create a collaborative team:
+ccmaster pm "Build a SaaS application with user management, billing, and analytics"
+
+# PM Claude creates a true team that works together:
+# - All team members share the same workspace (directory)
+# - PM sends tasks to team members throughout development
+# - Team members see each other's files and integrate their work
+# - PM monitors progress and coordinates between team members
+
+# Example team collaboration with error handling:
+# 1. Frontend Dev creates components/UserProfile.jsx
+# 2. Backend Dev sees it and creates matching API endpoints
+# 3. PM runs the project: npm start
+# 4. Error: "Cannot find module './UserProfile'"
+# 5. PM assigns to Frontend: "Fix import error in App.jsx"
+# 6. Frontend fixes, PM retests
+# 7. Error: "API connection refused on port 3001"
+# 8. PM assigns to Backend: "Start API server on port 3001"
+# 9. Backend fixes, PM retests until everything works
+# 10. PM coordinates deployment with DevOps
+
+# Dynamic team growth - type in PM terminal:
+"Add mobile apps for iOS and Android"
+# PM creates iOS/Android devs AND coordinates with existing team
+
+"Deploy to production on AWS"
+# PM creates Cloud Architect AND coordinates deployment tasks
 ```
 
-**2. Task Coordination**
+**2. Team Members Communicating Directly**
+```bash
+# Frontend needs something from Backend:
+/mcp__ccmaster__send_message_to_session session_id="backend_dev" message="I need user profile API endpoint"
+
+# Backend notifies completion:
+/mcp__ccmaster__notify_completion task_description="User profile API" output_details="GET /api/user/:id returns user data"
+
+# Designer broadcasts update:
+/mcp__ccmaster__broadcast_to_team message="New design system ready in /design/tokens.json" sender_role="UI Designer"
+
+# Managing dependencies:
+/mcp__ccmaster__wait_for_dependency dependency_session="backend_dev" dependency_description="Authentication middleware"
+```
+
+**3. Task Coordination**
 ```bash
 # Assign different parts of a project to different sessions:
 /mcp__ccmaster__coordinate_sessions 
@@ -324,7 +406,7 @@ CCMaster provides comprehensive session management tools within Claude:
   }'
 ```
 
-**3. Cross-Session Communication**
+**4. Cross-Session Communication**
 ```bash
 # Send status updates between sessions:
 /mcp__ccmaster__send_message_to_session 
@@ -333,7 +415,7 @@ CCMaster provides comprehensive session management tools within Claude:
   wait_for_response=true
 ```
 
-**4. Session Monitoring & Control**
+**5. Session Monitoring & Control**
 ```bash
 # Monitor all sessions:
 /mcp__ccmaster__list_sessions include_ended=false
