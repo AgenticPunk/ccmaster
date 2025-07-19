@@ -49,6 +49,9 @@ class Colors:
     YELLOW = '\033[93m'
     BLUE = '\033[94m'
     PURPLE = '\033[95m'
+    MAGENTA = '\033[95m'  # Same as purple
+    CYAN = '\033[96m'
+    GRAY = '\033[90m'
     ORANGE = '\033[38;5;208m'  # Orange color
     RESET = '\033[0m'
     BOLD = '\033[1m'
@@ -82,6 +85,12 @@ class CCMaster:
         # Multi-agent support
         self.active_sessions = {}  # session_id -> session data
         self.session_threads = {}  # session_id -> threads
+        self.session_identities = {}  # session_id -> identity mapping for teams
+        
+        # Initialize session identities from stored sessions
+        for session_id, session_data in self.sessions.items():
+            if 'identity' in session_data:
+                self.session_identities[session_id] = session_data['identity']
         self.watch_modes = {}  # session_id -> bool
         self.auto_continue_counts = {}  # session_id -> count
         self.max_turns = {}  # session_id -> max_turns
@@ -233,7 +242,7 @@ class CCMaster:
             self.mcp_server = None
     
     def create_project_mcp_config(self, working_dir):
-        """Add CCMaster MCP server to Claude Code using 'claude mcp add' command"""
+        """Add CCMaster MCP server to Claude Code using 'claude mcp add' command and direct file update"""
         if not self.mcp_enabled or not self.mcp_port:
             self.logger.warning("MCP not enabled or no port allocated")
             return
@@ -295,41 +304,104 @@ class CCMaster:
                 if verify_result.returncode == 0:
                     self.logger.info(f"Verified MCP server configuration: {verify_result.stdout.strip()}")
                 
-                # Check if .mcp.json was created
-                mcp_json_path = os.path.join(working_dir, '.mcp.json')
-                if os.path.exists(mcp_json_path):
-                    self.cli_log(f"✓ .mcp.json created", log_type='info', color=Colors.GREEN)
-                else:
-                    self.cli_log(f".mcp.json not found", log_type='warning')
-                
-                # Small delay to ensure file is written
-                time.sleep(0.5)
-                
-                # Double-check the file exists and is readable
-                if os.path.exists(mcp_json_path):
-                    try:
-                        with open(mcp_json_path, 'r') as f:
-                            mcp_content = json.load(f)
-                            self.cli_log(f"✓ .mcp.json: {len(mcp_content.get('mcpServers', {}))} servers", log_type='info', color=Colors.GREEN)
-                    except Exception as e:
-                        self.cli_log(f"Error reading .mcp.json: {e}", log_type='warning')
+                # Ensure .mcp.json is properly updated
+                self.ensure_mcp_json_updated(working_dir, stdio_server_path)
             else:
                 error_msg = result.stderr.strip() or result.stdout.strip()
                 self.logger.error(f"Failed to add MCP server: {error_msg}")
                 self.cli_log(f"Failed to add MCP server: {error_msg}", log_type='warning')
                 
-                # Fallback message
-                self.cli_log("You can manually add the MCP server with:", log_type='info')
-                self.cli_log(f"claude mcp add ccmaster -s project -- {sys.executable} {stdio_server_path} --host {self.mcp_host} --port {self.mcp_port}", log_type='info')
+                # Fallback: try direct file update
+                self.cli_log("Attempting direct .mcp.json update...", log_type='info')
+                self.ensure_mcp_json_updated(working_dir, stdio_server_path)
                 
         except FileNotFoundError:
             self.logger.error("'claude' command not found in PATH")
-            self.cli_log("Error: 'claude' command not found. Make sure Claude Code is installed and in your PATH.", log_type='error')
-            self.cli_log("To manually add the MCP server later:", log_type='info')
-            self.cli_log(f"claude mcp add ccmaster -s project -- {sys.executable} {stdio_server_path} --host {self.mcp_host} --port {self.mcp_port}", log_type='info')
+            self.cli_log("Error: 'claude' command not found. Will create .mcp.json directly.", log_type='warning')
+            # Create .mcp.json directly
+            self.ensure_mcp_json_updated(working_dir, stdio_server_path)
         except Exception as e:
             self.logger.error(f"Failed to execute 'claude mcp add': {e}")
-            self.cli_log(f"Error executing 'claude mcp add': {e}", log_type='error')
+            self.cli_log(f"Error executing 'claude mcp add': {e}. Will create .mcp.json directly.", log_type='warning')
+            # Create .mcp.json directly
+            self.ensure_mcp_json_updated(working_dir, stdio_server_path)
+    
+    def ensure_mcp_json_updated(self, working_dir, stdio_server_path):
+        """Ensure .mcp.json exists and has the latest CCMaster configuration"""
+        mcp_json_path = os.path.join(working_dir, '.mcp.json')
+        
+        # Default MCP configuration for CCMaster
+        ccmaster_config = {
+            "command": sys.executable,
+            "args": [
+                stdio_server_path,
+                "--host", self.mcp_host,
+                "--port", str(self.mcp_port)
+            ]
+        }
+        
+        try:
+            # Check if .mcp.json exists
+            if os.path.exists(mcp_json_path):
+                # Read existing content
+                with open(mcp_json_path, 'r') as f:
+                    mcp_content = json.load(f)
+                
+                # Ensure mcpServers key exists
+                if 'mcpServers' not in mcp_content:
+                    mcp_content['mcpServers'] = {}
+                
+                # Check if ccmaster config needs updating
+                existing_ccmaster = mcp_content['mcpServers'].get('ccmaster', {})
+                needs_update = (
+                    existing_ccmaster.get('command') != ccmaster_config['command'] or
+                    existing_ccmaster.get('args') != ccmaster_config['args']
+                )
+                
+                if needs_update:
+                    self.cli_log("✓ Updating CCMaster configuration in .mcp.json", log_type='info', color=Colors.GREEN)
+                else:
+                    self.cli_log("✓ CCMaster configuration is up to date", log_type='info', color=Colors.GREEN)
+                
+                # Always update to ensure latest configuration
+                mcp_content['mcpServers']['ccmaster'] = ccmaster_config
+            else:
+                # Create new .mcp.json
+                mcp_content = {
+                    "mcpServers": {
+                        "ccmaster": ccmaster_config
+                    }
+                }
+                self.cli_log("✓ Creating new .mcp.json", log_type='info', color=Colors.GREEN)
+            
+            # Write the updated/new content
+            with open(mcp_json_path, 'w') as f:
+                json.dump(mcp_content, f, indent=2)
+            
+            self.cli_log(f"✓ .mcp.json updated with latest CCMaster MCP configuration", log_type='info', color=Colors.GREEN)
+            
+            # List available tools
+            self.cli_log(f"✓ MCP tools available:", log_type='info', color=Colors.GREEN)
+            self.cli_log(f"  • /mcp__ccmaster__session - Session management (create, control, monitor)", log_type='info')
+            self.cli_log(f"  • /mcp__ccmaster__communicate - Multi-method communication", log_type='info')
+            self.cli_log(f"  • /mcp__ccmaster__job - Job queue management", log_type='info')
+            self.cli_log(f"  • /mcp__ccmaster__team - Team identity management", log_type='info')
+            self.cli_log(f"  • /mcp__ccmaster__list_sessions - List all sessions", log_type='info')
+            self.cli_log(f"  • /mcp__ccmaster__prompt - Send console messages", log_type='info')
+            self.cli_log(f"  • /mcp__ccmaster__kill_self - Self-terminate session", log_type='info')
+            
+            # Verify the file
+            with open(mcp_json_path, 'r') as f:
+                final_content = json.load(f)
+                servers_count = len(final_content.get('mcpServers', {}))
+                self.cli_log(f"✓ .mcp.json: {servers_count} server(s) configured", log_type='info', color=Colors.GREEN)
+                
+        except Exception as e:
+            self.logger.error(f"Failed to update .mcp.json: {e}")
+            self.cli_log(f"Error updating .mcp.json: {e}", log_type='error')
+            # Still provide manual command
+            self.cli_log("You can manually add the MCP server with:", log_type='info')
+            self.cli_log(f"claude mcp add ccmaster -s project -- {sys.executable} {stdio_server_path} --host {self.mcp_host} --port {self.mcp_port}", log_type='info')
     
     def create_claude_settings(self, working_dir):
         """Create .claude/settings.local.json to auto-enable MCP servers"""
@@ -451,14 +523,150 @@ class CCMaster:
         self.save_sessions()
         return session_id
     
+    def check_and_start_job(self, session_id):
+        """Check job queue and start highest priority job if idle"""
+        try:
+            # Check if session is idle
+            current_status = self.current_status.get(session_id)
+            if current_status != 'idle':
+                # Debug log
+                self.log_event(session_id, 'JOB_CHECK', f'Session not idle (status: {current_status}), skipping job check', display=False)
+                return None
+            
+            # Get job queue directory
+            job_queue_dir = Path(os.path.expanduser(f"~/.ccmaster/job_queue/{session_id}"))
+            if not job_queue_dir.exists():
+                self.log_event(session_id, 'JOB_CHECK', f'No job queue directory for session', display=False)
+                return None
+            
+            # Debug: log that we're checking jobs
+            self.log_event(session_id, 'JOB_CHECK', f'Checking job queue at {job_queue_dir}', display=False)
+            
+            # Find highest priority pending job
+            pending_jobs = []
+            for job_file in job_queue_dir.glob("*.json"):
+                try:
+                    with open(job_file, 'r') as f:
+                        job_data = json.load(f)
+                    
+                    # Check if job is pending and dependencies are met
+                    if job_data.get('status') == 'pending':
+                        # Check dependencies
+                        deps_met = True
+                        if job_data.get('dependencies'):
+                            for dep_id in job_data['dependencies']:
+                                # Check if dependency is completed
+                                dep_file = job_queue_dir / f"{dep_id}.json"
+                                if dep_file.exists():
+                                    with open(dep_file, 'r') as df:
+                                        dep_data = json.load(df)
+                                    if dep_data.get('status') != 'done':
+                                        deps_met = False
+                                        break
+                        
+                        if deps_met:
+                            pending_jobs.append(job_data)
+                except:
+                    pass
+            
+            if not pending_jobs:
+                self.log_event(session_id, 'JOB_CHECK', f'No pending jobs found in queue', display=False)
+                return None
+            
+            self.log_event(session_id, 'JOB_CHECK', f'Found {len(pending_jobs)} pending jobs', display=False)
+            
+            # Sort by priority (p0 first) and creation time
+            priority_order = {"p0": 0, "p1": 1, "p2": 2}
+            pending_jobs.sort(key=lambda x: (
+                priority_order.get(x.get('priority', 'p1'), 1),
+                x.get('created_at', '')
+            ))
+            
+            # Get the highest priority job
+            job = pending_jobs[0]
+            job_id = job['id']
+            
+            # Update job status to doing
+            job['status'] = 'doing'
+            job['started_at'] = datetime.now().isoformat()
+            
+            job_file = job_queue_dir / f"{job_id}.json"
+            with open(job_file, 'w') as f:
+                json.dump(job, f, indent=2)
+            
+            # Notify about job start with more details
+            prefix = self.get_session_prefix(session_id)
+            identity = self.session_identities.get(session_id, session_id)
+            self.cli_log(f"🔨 Starting job: {job['title']} ({job['priority']})", 
+                        log_type='info', prefix=prefix, color=Colors.MAGENTA)
+            self.cli_log(f"📋 Job ID: {job_id} | Created by: {job.get('created_by_identity', 'unknown')}", 
+                        log_type='info', prefix=prefix, color=Colors.CYAN)
+            
+            # Send job description as prompt with clear instructions
+            job_prompt = f"""[AUTOMATED JOB EXECUTION]
+Job: {job['title']}
+Priority: {job['priority']}
+Job ID: {job_id}
+
+Description:
+{job['description']}
+
+Please complete this job and when finished, use:
+/mcp__ccmaster__job action="complete" job_id="{job_id}" result="<summary of what was done>"
+"""
+            self.log_event(session_id, 'JOB_EXECUTE', f'Sending job prompt to session', display=False)
+            result = self.send_continue_to_claude(session_id, job_prompt)
+            self.log_event(session_id, 'JOB_EXECUTE', f'Job prompt send result: {result}', display=False)
+            
+            return job_id
+            
+        except Exception as e:
+            self.log_event(session_id, 'ERROR', f'Job check error: {str(e)}', display=False)
+            return None
+    
+    def check_session_mail(self, session_id):
+        """Check if session has unread mail and notify"""
+        try:
+            # Check mailbox for unread mail
+            mailbox_path = Path(os.path.expanduser(f"~/.ccmaster/mailbox/{session_id}/inbox"))
+            if not mailbox_path.exists():
+                return 0
+            
+            unread_count = 0
+            for mail_file in mailbox_path.glob("*.json"):
+                try:
+                    with open(mail_file, 'r') as f:
+                        mail_data = json.load(f)
+                    if session_id not in mail_data.get('read_by', []):
+                        unread_count += 1
+                except:
+                    pass
+            
+            # Notify if there are unread mails
+            if unread_count > 0:
+                prefix = self.get_session_prefix(session_id)
+                self.cli_log(f"📬 You have {unread_count} unread mail(s)", log_type='info', prefix=prefix, color=Colors.CYAN)
+            
+            return unread_count
+        except Exception:
+            return 0
+    
     def get_session_prefix(self, session_id):
         """Get session prefix for multi-session mode"""
         if session_id in self.active_sessions and len(self.active_sessions) >= 2:
             idx = self.active_sessions[session_id]['index']
-            # Add MCP indicator for MCP-created sessions
-            if session_id.startswith('mcp_'):
+            
+            # Check if session has an identity
+            identity = self.sessions.get(session_id, {}).get('identity')
+            
+            if identity:
+                # Use identity as the primary label
+                return f"[{identity}]"
+            elif session_id.startswith('mcp_'):
+                # Fallback to MCP indicator
                 return f"[MCP-{idx}]"
             else:
+                # Fallback to numeric index
                 return f"[{idx}]"
         return ""
     
@@ -854,6 +1062,26 @@ class CCMaster:
             self.cli_log("No terminal window info stored for this session", log_type='warning')
             return False
         
+        # Split message into lines for proper handling
+        lines = message.split('\n')
+        
+        # Build AppleScript commands for each line
+        keystroke_commands = []
+        for i, line in enumerate(lines):
+            # Escape special characters in each line
+            escaped_line = line.replace('\\', '\\\\').replace('"', '\\"')
+            if i < len(lines) - 1:
+                # For all but the last line, add shift+return for newline
+                keystroke_commands.append(f'keystroke "{escaped_line}"')
+                keystroke_commands.append('key code 36 using shift down')  # shift+return
+            else:
+                # For the last line, just type it
+                if escaped_line:  # Only add if not empty
+                    keystroke_commands.append(f'keystroke "{escaped_line}"')
+        
+        # Join all keystrokes
+        keystroke_sequence = '\n                                    '.join(keystroke_commands)
+        
         # Use specific window and find Claude tab
         specific_script = f'''
         tell application "Terminal"
@@ -876,7 +1104,7 @@ class CCMaster:
                             -- Type message and press return
                             tell application "System Events"
                                 tell process "Terminal"
-                                    keystroke "{message}"
+                                    {keystroke_sequence}
                                     delay 0.1
                                     keystroke return
                                 end tell
@@ -1001,7 +1229,7 @@ class CCMaster:
         applescript = f'''
         tell application "Terminal"
             activate
-            set newTab to do script "cd '{working_dir}' && pwd && ls -la .mcp.json 2>/dev/null && {claude_cmd}"
+            set newTab to do script "cd '{working_dir}' && export CCMASTER_SESSION_ID={session_id} && pwd && ls -la .mcp.json 2>/dev/null && {claude_cmd}"
             set windowId to id of window 1
             -- Get the tab index
             set tabIndex to 1
@@ -1117,6 +1345,9 @@ class CCMaster:
                     else:
                         prefix = self.get_session_prefix(session_id)
                         self.cli_log("Watch: OFF", log_type='info', prefix=prefix)
+                elif key == 'j':
+                    # Show job queue summary
+                    self.show_job_queue_summary()
                 
                 # Process messages from queue
                 try:
@@ -1149,6 +1380,11 @@ class CCMaster:
                             elif 'Idle' in message:
                                 self.current_status[session_id_from_msg] = 'idle'
                                 self.cli_log(self.format_status_line('idle'), log_type='status_idle', prefix=prefix)
+                                # Check for jobs first, then mail when session becomes idle
+                                job_started = self.check_and_start_job(session_id_from_msg)
+                                if not job_started:
+                                    # Only check mail if no job was started
+                                    self.check_session_mail(session_id_from_msg)
                             
                         elif event_type == 'USER':
                             # Format user prompt
@@ -1209,6 +1445,23 @@ class CCMaster:
                     session_watch_mode = self.watch_modes.get(check_session_id, watch_mode if check_session_id == session_id else False)
                     session_first_prompt = self.has_seen_first_prompt.get(check_session_id, False)
                     session_idle = self.current_status.get(check_session_id) == 'idle'
+                    
+                    # Check jobs and mail for idle sessions periodically
+                    if session_idle:
+                        # Initialize last_idle_check if needed
+                        if not hasattr(self, 'last_idle_check'):
+                            self.last_idle_check = {}
+                        
+                        # Check every 20 seconds for idle sessions
+                        current_time = time.time()
+                        last_check = self.last_idle_check.get(check_session_id, 0)
+                        if current_time - last_check > 20:
+                            # Check for jobs first
+                            job_started = self.check_and_start_job(check_session_id)
+                            if not job_started:
+                                # Only check mail if no job was started
+                                self.check_session_mail(check_session_id)
+                            self.last_idle_check[check_session_id] = current_time
                     
                     # Handle auto-continue for each idle session
                     if session_watch_mode and session_idle and session_first_prompt:
@@ -1517,6 +1770,76 @@ class CCMaster:
                 if not self.should_stop:
                     self.log_event(session_id, 'ERROR', f'Status monitoring error: {str(e)}')
     
+    def show_job_queue_summary(self):
+        """Show job queue summary across all sessions"""
+        self.cli_log("\n📋 Job Queue Summary", log_type='info', color=Colors.MAGENTA)
+        self.cli_log("=" * 60, log_type='info')
+        
+        total_jobs = 0
+        
+        for session_id, session_data in self.sessions.items():
+            if session_data.get('status') == 'ended':
+                continue
+                
+            # Check job queue for this session
+            job_queue_dir = Path(os.path.expanduser(f"~/.ccmaster/job_queue/{session_id}"))
+            if not job_queue_dir.exists():
+                continue
+            
+            session_jobs = {'pending': [], 'doing': [], 'done': []}
+            
+            for job_file in job_queue_dir.glob("*.json"):
+                try:
+                    with open(job_file, 'r') as f:
+                        job_data = json.load(f)
+                    status = job_data.get('status', 'pending')
+                    session_jobs[status].append(job_data)
+                    total_jobs += 1
+                except:
+                    pass
+            
+            if any(session_jobs.values()):
+                identity = self.session_identities.get(session_id, session_id)
+                status = self.current_status.get(session_id, 'unknown')
+                
+                self.cli_log(f"\n{identity} ({status}):", log_type='info', color=Colors.CYAN)
+                
+                # Show jobs by status
+                for status_type, jobs in session_jobs.items():
+                    if jobs:
+                        if status_type == 'pending':
+                            color = Colors.YELLOW
+                            icon = "⏳"
+                        elif status_type == 'doing':
+                            color = Colors.GREEN
+                            icon = "🔨"
+                        else:  # done
+                            color = Colors.GRAY
+                            icon = "✅"
+                        
+                        # Sort by priority and creation time
+                        if status_type == 'pending':
+                            priority_order = {"p0": 0, "p1": 1, "p2": 2}
+                            jobs.sort(key=lambda x: (
+                                priority_order.get(x.get('priority', 'p1'), 1),
+                                x.get('created_at', '')
+                            ))
+                        
+                        for job in jobs[:5]:  # Show max 5 per status
+                            self.cli_log(f"  {icon} [{job.get('priority', 'p1')}] {job.get('title', 'Untitled')}", 
+                                       log_type='info', color=color)
+                        
+                        if len(jobs) > 5:
+                            self.cli_log(f"  ... and {len(jobs) - 5} more {status_type} jobs", 
+                                       log_type='info', color=Colors.GRAY)
+        
+        if total_jobs == 0:
+            self.cli_log("\nNo jobs in any queue", log_type='info', color=Colors.GRAY)
+        else:
+            self.cli_log(f"\nTotal: {total_jobs} jobs across all sessions", log_type='info', color=Colors.MAGENTA)
+        
+        self.cli_log("=" * 60, log_type='info')
+    
     def list_sessions(self):
         """List all sessions"""
         if not self.sessions:
@@ -1664,7 +1987,7 @@ class CCMaster:
             applescript = f'''
             tell application "Terminal"
                 activate
-                set newTab to do script "cd '{working_dir}' && pwd && ls -la .mcp.json 2>/dev/null && {claude_cmd}"
+                set newTab to do script "cd '{working_dir}' && export CCMASTER_SESSION_ID={session_id} && pwd && ls -la .mcp.json 2>/dev/null && {claude_cmd}"
                 set windowId to id of window 1
                 set tabIndex to 1
                 repeat with t in tabs of window 1
@@ -1724,7 +2047,7 @@ class CCMaster:
             if i < num_instances - 1:
                 time.sleep(1)
         
-        self.cli_log(f"All {num_instances} sessions launched. Press [q] to quit, [w] to toggle watch", log_type='launch', newline_before=True)
+        self.cli_log(f"All {num_instances} sessions launched. Press [q] to quit, [w] to toggle watch, [j] for jobs", log_type='launch', newline_before=True)
         
         # Message printer thread for multi-agent
         printer_thread = threading.Thread(
@@ -1760,6 +2083,9 @@ class CCMaster:
                         self.cli_log("Watch: ON (all sessions)", log_type='info', color=Colors.GREEN, newline_before=True)
                     else:
                         self.cli_log("Watch: OFF (all sessions)", log_type='info', newline_before=True)
+                elif key == 'j':
+                    # Show job queue summary
+                    self.show_job_queue_summary()
                 
                 # Check session statuses and handle auto-continue
                 for session_id in list(self.active_sessions.keys()):
@@ -1947,6 +2273,9 @@ def main():
     prompts_parser = subparsers.add_parser('prompts', help='View user prompts for a session')
     prompts_parser.add_argument('session_id', help='Session ID')
     
+    # Jobs command
+    jobs_parser = subparsers.add_parser('jobs', help='Show job queue summary across all sessions')
+    
     # Version command
     version_parser = subparsers.add_parser('version', help='Show CCMaster version')
     
@@ -1990,6 +2319,8 @@ def main():
             cc.view_logs(args.session_id)
         elif args.command == 'prompts':
             cc.view_prompts(args.session_id)
+        elif args.command == 'jobs':
+            cc.show_job_queue_summary()
         elif args.command == 'version':
             cc.cli_log(f"CCMaster version {__version__}", log_type='info')
             cc.cli_log("Claude Code Session Manager", log_type='launch')
