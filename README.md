@@ -19,6 +19,9 @@ CCMaster is an intelligent session management tool for Claude Code. It automatic
 - 💬 **Cross-Session Communication**: Send messages and coordinate tasks between sessions
 - 🔄 **Unified Session Management**: All sessions (original + MCP-created) tracked with consistent prefixes
 - 🛡️ **Session Lifecycle Control**: CLI stays alive until all sessions end, proper cleanup on termination
+- 💾 **Session Recovery**: Load and resume previous sessions with full context using `ccmaster load`
+- 🗑️ **Session Management**: Delete unwanted sessions through interactive interface
+- 🔚 **Auto-Close Sessions**: All Claude sessions automatically close when CCMaster exits
 - 🧠 **PM Mode**: Claude analyzes project requirements and creates a truly collaborative team of specialized instances
 - 🤝 **Real Team Collaboration**: All team members work in shared workspace, PM coordinates tasks and monitors progress
 - 📋 **Dynamic Task Assignment**: PM sends specific tasks to team members based on project needs and progress
@@ -82,6 +85,9 @@ ccmaster pm "Your project description" --pm-template template.md  # Custom templ
 
 # List all sessions
 ccmaster list
+
+# Load and resume a previous session (interactive)
+ccmaster load
 
 # View session logs
 ccmaster logs 20240124_143022
@@ -218,6 +224,29 @@ Each session (original or MCP-created):
 - Has isolated hook configurations for clean monitoring
 - Can communicate with other sessions via MCP tools
 - Supports dynamic creation during runtime
+
+### Session Recovery & Management
+
+CCMaster provides powerful session recovery features:
+
+```bash
+# Launch the interactive session loader
+ccmaster load
+```
+
+Features:
+- **Interactive Selection**: Navigate through sessions with arrow keys
+- **Session Details**: View ID, role, status, working directory, and start time
+- **Load & Resume**: Press Enter to resume a session with full context
+- **Delete Sessions**: Press 'd' to delete unwanted sessions and their logs
+- **Context Restoration**: Previous prompts are included when resuming
+- **Auto-Close on Exit**: All active Claude sessions close when CCMaster exits
+
+When resuming a session:
+1. Working directory is restored
+2. Claude starts fresh and waits for your input
+3. Full monitoring and watch mode support
+4. **PM Sessions**: Automatically resumes all team members together
 
 ### Key Components
 

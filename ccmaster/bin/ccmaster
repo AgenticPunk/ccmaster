@@ -1487,6 +1487,242 @@ class CCMaster:
                 print(formatted_msg)
                 sys.stdout.flush()
     
+    def monitor_single_session(self, session_id, working_dir, watch_mode=False, max_turns=None):
+        """Monitor an existing session without creating a new one"""
+        # Register in active sessions if not already there
+        if session_id not in self.active_sessions:
+            self.active_sessions[session_id] = {
+                'index': 1,
+                'working_dir': working_dir,
+                'created_at': self.sessions[session_id].get('started_at'),
+                'resumed_at': datetime.now().isoformat()
+            }
+        
+        # Initialize monitoring structures
+        if session_id not in self.watch_modes:
+            self.watch_modes[session_id] = watch_mode
+        if session_id not in self.auto_continue_counts:
+            self.auto_continue_counts[session_id] = 0
+        if session_id not in self.has_seen_first_prompt:
+            self.has_seen_first_prompt[session_id] = True  # Resumed sessions don't auto-continue until user interacts
+        if max_turns:
+            self.max_turns[session_id] = max_turns
+        
+        # Print session info
+        self.cli_log(f"Monitoring session in {working_dir}", log_type='launch')
+        self.cli_log(f"Session ID: {session_id}", log_type='info')
+        if watch_mode:
+            if max_turns:
+                self.cli_log("Watch mode: ON - Will auto-continue after idle", log_type='info', color=Colors.GREEN)
+            else:
+                self.cli_log("Watch mode: ON - Will auto-continue after idle", log_type='info', color=Colors.GREEN)
+        else:
+            self.cli_log("Watch mode: OFF - Press [w] to toggle", log_type='info')
+        
+        # Initialize current_status for this session
+        if isinstance(self.current_status, dict):
+            self.current_status[session_id] = 'idle'
+        
+        # Set up terminal for keyboard input
+        old_settings = termios.tcgetattr(sys.stdin)
+        
+        try:
+            # Configure terminal for non-blocking input
+            tty.setraw(sys.stdin.fileno())
+            
+            # Initial status
+            last_idle_time = {}
+            
+            # Main monitoring loop
+            while True:
+                # Check for keyboard input
+                key = self.check_keyboard_input()
+                if key == 'q':
+                    prefix = self.get_session_prefix(session_id)
+                    self.cli_log("Stopping session monitor...", log_type='end', prefix=prefix, newline_before=True)
+                    self.should_stop = True
+                    break
+                elif key == 'w':
+                    current_count = self.auto_continue_counts.get(session_id, 0)
+                    was_at_max_turns = max_turns and current_count >= max_turns
+                    watch_mode = not watch_mode
+                    self.watch_modes[session_id] = watch_mode
+                    
+                    timestamp = datetime.now()
+                    time_str = timestamp.strftime('%H:%M:%S')
+                    if watch_mode:
+                        # Reset auto-continue count when toggling watch mode on after hitting max
+                        if was_at_max_turns:
+                            self.auto_continue_counts[session_id] = 0
+                            prefix = self.get_session_prefix(session_id)
+                            self.cli_log("Auto-continue count reset", log_type='info', prefix=prefix, color=Colors.GREEN)
+                        
+                        prefix = self.get_session_prefix(session_id)
+                        if max_turns:
+                            current_count = self.auto_continue_counts.get(session_id, 0)
+                            remaining = max_turns - current_count
+                            self.cli_log(f"Watch mode: ON - Will auto-continue after idle ({remaining} turns left)", log_type='info', prefix=prefix, color=Colors.GREEN)
+                        else:
+                            self.cli_log("Watch mode: ON - Will auto-continue after idle", log_type='info', prefix=prefix, color=Colors.GREEN)
+                        
+                        # If we're currently idle and re-enabling after max turns, set idle time for delayed continue
+                        current_session_status = self.current_status.get(session_id) if isinstance(self.current_status, dict) else self.current_status
+                        if was_at_max_turns and current_session_status == 'idle':
+                            # Set idle time to trigger auto-continue after delay
+                            last_idle_time[session_id] = time.time()
+                    else:
+                        prefix = self.get_session_prefix(session_id)
+                        self.cli_log("Watch mode: OFF", log_type='info', prefix=prefix)
+                        # Reset idle time tracking
+                        last_idle_time.clear()
+                
+                # Process messages from queue
+                try:
+                    while True:
+                        # Get 5-tuple message (session_id, msg_type, timestamp, event_type, message)
+                        session_id_from_msg, msg_type, timestamp, event_type, message = self.message_queue.get_nowait()
+                        
+                        # Only process messages for this session
+                        if session_id_from_msg != session_id:
+                            continue
+                        
+                        # Get session prefix for multi-session display
+                        prefix = self.get_session_prefix(session_id_from_msg)
+                        
+                        if msg_type == 'STATUS':
+                            # Handle status updates
+                            if 'Working' in message:
+                                self.current_status[session_id_from_msg] = 'working'
+                                if 'tool:' in message:
+                                    tool = message.split('tool:')[1].strip()
+                                    self.cli_log(self.format_status_line('working'), log_type='status_working', prefix=prefix)
+                                    self.cli_log(f"Using {tool}", log_type='tool', prefix=prefix)
+                                else:
+                                    self.cli_log(self.format_status_line('working'), log_type='status_working', prefix=prefix)
+                            elif 'Processing' in message:
+                                self.current_status[session_id_from_msg] = 'processing'
+                                self.cli_log(self.format_status_line('processing'), log_type='status_processing', prefix=prefix)
+                            elif 'Thinking' in message:
+                                self.current_status[session_id_from_msg] = 'thinking'
+                                self.cli_log(self.format_status_line('thinking'), log_type='status_thinking', prefix=prefix)
+                            elif 'Idle' in message:
+                                self.current_status[session_id_from_msg] = 'idle'
+                                # Record when this session became idle for auto-continue delay
+                                last_idle_time[session_id_from_msg] = time.time()
+                                self.cli_log(self.format_status_line('idle'), log_type='status_idle', prefix=prefix)
+                            
+                        elif event_type == 'USER':
+                            # Format user prompt
+                            prompt_preview = message[:50] + '...' if len(message) > 50 else message
+                            prompt_preview = prompt_preview.replace('\n', ' ')
+                            self.cli_log(f"User: \"{prompt_preview}\"", log_type='user', prefix=prefix)
+                            self.has_seen_first_prompt[session_id_from_msg] = True
+                            # Reset idle time when user types
+                            if session_id_from_msg in last_idle_time:
+                                del last_idle_time[session_id_from_msg]
+                            
+                        elif event_type == 'SESSION_END':
+                            self.cli_log(message, log_type='end', prefix=prefix, newline_before=True)
+                            # Don't stop CLI - let the session removal logic handle it
+                            
+                        elif event_type == 'LAUNCH':
+                            self.cli_log(message, log_type='launch', prefix=prefix)
+                            
+                        elif event_type == 'PROCESS':
+                            self.cli_log(message, log_type='process', prefix=prefix)
+                            
+                        elif event_type == 'WARNING':
+                            self.cli_log(message, log_type='warning', prefix=prefix)
+                            
+                        elif event_type == 'ERROR':
+                            self.cli_log(message, log_type='error', prefix=prefix)
+                            
+                except queue.Empty:
+                    pass
+                
+                # Check for session terminations and handle auto-continue
+                if session_id in self.active_sessions and session_id in self.current_status:
+                    # First check if terminal window is still open
+                    if not self.is_terminal_window_open(session_id):
+                        prefix = self.get_session_prefix(session_id)
+                        self.cli_log('Terminal window closed', log_type='end', prefix=prefix, newline_before=True)
+                        # Update session status
+                        if session_id in self.sessions:
+                            self.sessions[session_id]['status'] = 'ended'
+                            self.sessions[session_id]['ended_at'] = datetime.now().isoformat()
+                            self.save_sessions()
+                        # Remove from active sessions
+                        del self.active_sessions[session_id]
+                        break
+                    
+                    # Get session-specific watch mode and status
+                    session_watch_mode = self.watch_modes.get(session_id, watch_mode)
+                    session_first_prompt = self.has_seen_first_prompt.get(session_id, False)
+                    session_idle = self.current_status.get(session_id) == 'idle'
+                    
+                    # Handle auto-continue for idle session with delay
+                    if session_watch_mode and session_idle and session_first_prompt:
+                        # Check if session has been idle long enough (2 seconds delay)
+                        idle_time = last_idle_time.get(session_id, 0)
+                        if idle_time > 0 and time.time() - idle_time >= 2.0:
+                            session_max_turns = self.max_turns.get(session_id)
+                            session_count = self.auto_continue_counts.get(session_id, 0)
+                            
+                            if session_max_turns is None or session_count < session_max_turns:
+                                # Send continue to this specific session
+                                if self.send_continue_to_claude(session_id):
+                                    self.auto_continue_counts[session_id] = session_count + 1
+                                    
+                                    # Clear idle time to prevent immediate re-trigger
+                                    if session_id in last_idle_time:
+                                        del last_idle_time[session_id]
+                                    
+                                    # Log with session prefix
+                                    prefix = self.get_session_prefix(session_id)
+                                    
+                                    if session_max_turns:
+                                        msg = f"Auto-continue ({session_count + 1}/{session_max_turns})"
+                                    else:
+                                        msg = f"Auto-continue"
+                                    
+                                    if prefix:
+                                        self.cli_log(msg, log_type='auto_continue', prefix=prefix, color=Colors.GREEN)
+                                    else:
+                                        self.cli_log(msg, log_type='auto_continue', color=Colors.GREEN)
+                                    
+                                    self.log_event(session_id, 'AUTO_CONTINUE', f'Sent auto-continue #{session_count + 1}', display=False)
+                            else:
+                                # Max turns reached, disable watch mode for this session
+                                self.watch_modes[session_id] = False
+                                prefix = self.get_session_prefix(session_id)
+                                self.cli_log(f"Max auto-continue turns ({session_max_turns}) reached - Watch mode disabled", log_type='warning', prefix=prefix)
+                                self.cli_log("Press [w] to re-enable and continue", log_type='info', prefix=prefix)
+                                if session_id in last_idle_time:
+                                    del last_idle_time[session_id]
+                
+                # Only break if user requested stop or session ended
+                if self.should_stop or session_id not in self.active_sessions:
+                    break
+                
+                # Small sleep to prevent busy-waiting
+                time.sleep(0.1)
+                
+        except KeyboardInterrupt:
+            self.cli_log("Session interrupted by user", log_type='end', newline_before=True)
+        finally:
+            # Restore terminal settings
+            termios.tcsetattr(sys.stdin, termios.TCSADRAIN, old_settings)
+            self.cli_log("Session ended", log_type='end', newline_before=True)
+            
+            # Update session status
+            if session_id in self.sessions:
+                self.sessions[session_id]['status'] = 'ended'
+                self.sessions[session_id]['ended_at'] = datetime.now().isoformat()
+                self.save_sessions()
+            
+            # Restore original hooks configuration
+            self.restore_hooks_config(session_id)
+    
     def monitor_status(self, session_id):
         """Monitor the status file for updates"""
         status_file = self.status_dir / f"{session_id}.json"
@@ -1644,6 +1880,448 @@ class CCMaster:
                     self.cli_log("-" * 40, log_type='info')
                 except json.JSONDecodeError:
                     self.cli_log(line.strip(), log_type='info')
+    
+    def kill_all_active_sessions(self):
+        """Kill all active Claude sessions"""
+        if not self.active_sessions:
+            return
+        
+        self.cli_log("Closing all active Claude sessions...", log_type='info')
+        
+        for session_id in list(self.active_sessions.keys()):
+            try:
+                # Try to close Terminal window gracefully
+                if 'terminal_window_id' in self.sessions.get(session_id, {}):
+                    window_id = self.sessions[session_id]['terminal_window_id']
+                    close_script = f'''
+                    tell application "Terminal"
+                        try
+                            close window id {window_id}
+                        end try
+                    end tell
+                    '''
+                    subprocess.run(['osascript', '-e', close_script], capture_output=True)
+                
+                # Also try to kill the Claude process if we have PID
+                if 'claude_pid' in self.sessions.get(session_id, {}):
+                    pid = self.sessions[session_id]['claude_pid']
+                    try:
+                        os.kill(pid, 15)  # SIGTERM
+                    except:
+                        pass
+            except Exception as e:
+                self.logger.error(f"Error killing session {session_id}: {e}")
+        
+        # Update session statuses
+        for session_id in list(self.active_sessions.keys()):
+            if session_id in self.sessions:
+                self.sessions[session_id]['status'] = 'ended'
+                self.sessions[session_id]['ended_at'] = datetime.now().isoformat()
+        self.save_sessions()
+        
+        self.cli_log("All sessions closed.", log_type='info')
+    
+    def interactive_session_selector(self, sessions_list, allow_delete=False):
+        """Interactive session selector with arrow keys"""
+        if not sessions_list:
+            self.cli_log("No sessions available.", log_type='warning')
+            return None, None
+        
+        # Set up terminal for raw input
+        old_settings = termios.tcgetattr(sys.stdin)
+        
+        try:
+            tty.setraw(sys.stdin.fileno())
+            
+            selected_index = 0
+            action = None
+            
+            while True:
+                # Get terminal size
+                import shutil
+                term_cols, term_rows = shutil.get_terminal_size(fallback=(80, 24))
+                
+                # Build the entire screen content first
+                screen_lines = []
+                
+                # Header
+                screen_lines.append(f"{Colors.BOLD}CCMaster Session Loader{Colors.RESET}")
+                screen_lines.append(f"Use ↑/↓ to navigate, Enter to load, 'd' to delete{' (if available)' if allow_delete else ''}, 'q' to quit")
+                screen_lines.append("=" * min(term_cols, 100))
+                
+                # Calculate available rows for sessions (header=3, footer=3, margins=2)
+                header_rows = 4  # Title, controls, separator, blank
+                footer_rows = 3  # Blank, controls, blank
+                available_rows = term_rows - header_rows - footer_rows
+                
+                # Calculate visible window
+                if len(sessions_list) <= available_rows:
+                    # All sessions fit on screen
+                    start_idx = 0
+                    end_idx = len(sessions_list)
+                else:
+                    # Need scrolling
+                    # Keep selected item in middle of screen when possible
+                    half_window = available_rows // 2
+                    if selected_index < half_window:
+                        start_idx = 0
+                        end_idx = available_rows
+                    elif selected_index >= len(sessions_list) - half_window:
+                        start_idx = len(sessions_list) - available_rows
+                        end_idx = len(sessions_list)
+                    else:
+                        start_idx = selected_index - half_window
+                        end_idx = selected_index + half_window + (available_rows % 2)
+                
+                # Show scroll indicators
+                if start_idx > 0:
+                    screen_lines.append(f"  {Colors.YELLOW}↑ {start_idx} more sessions above ↑{Colors.RESET}")
+                    start_idx += 1  # Adjust for indicator row
+                    
+                # Display visible sessions
+                for i in range(start_idx, min(end_idx, len(sessions_list))):
+                    session = sessions_list[i]
+                    session_id = session['id']
+                    status = session['status']
+                    role = session.get('role', 'Session')
+                    working_dir = session['working_dir']
+                    started = datetime.fromisoformat(session['started_at']).strftime('%m-%d %H:%M')
+                    
+                    # Format status with color
+                    if status == 'running':
+                        status_display = f"{Colors.GREEN}●{Colors.RESET}"
+                    elif status == 'ended':
+                        status_display = f"{Colors.RED}●{Colors.RESET}"
+                    else:
+                        status_display = "●"
+                    
+                    # Truncate fields to fit terminal width
+                    # Reserve space: selector(2) + status(1) + spaces(8) + started(11)
+                    remaining_width = term_cols - 22
+                    
+                    # Allocate width proportionally
+                    id_width = min(25, remaining_width // 3)
+                    role_width = min(20, remaining_width // 3)
+                    dir_width = remaining_width - id_width - role_width
+                    
+                    # Truncate with ellipsis if needed
+                    display_id = session_id[:id_width-3] + '...' if len(session_id) > id_width else session_id.ljust(id_width)
+                    display_role = role[:role_width-3] + '...' if len(role) > role_width else role.ljust(role_width)
+                    display_dir = working_dir[:dir_width-3] + '...' if len(working_dir) > dir_width else working_dir
+                    
+                    # Highlight selected line
+                    if i == selected_index:
+                        screen_lines.append(f"{Colors.BLUE}▶ {status_display} {display_id} {display_role} {started} {display_dir}{Colors.RESET}")
+                    else:
+                        screen_lines.append(f"  {status_display} {display_id} {display_role} {started} {display_dir}")
+                
+                # Show scroll indicator at bottom
+                if end_idx < len(sessions_list):
+                    screen_lines.append(f"  {Colors.YELLOW}↓ {len(sessions_list) - end_idx} more sessions below ↓{Colors.RESET}")
+                
+                # Fill blank lines to push controls to bottom
+                current_lines = len(screen_lines)
+                blank_lines_needed = term_rows - current_lines - 2  # 2 for control line and bottom margin
+                for _ in range(max(0, blank_lines_needed)):
+                    screen_lines.append("")
+                    
+                # Add controls at bottom
+                screen_lines.append(f"{Colors.BOLD}Controls:{Colors.RESET} ↑/↓ Navigate | Enter: Load | d: Delete | q: Quit")
+                
+                # Clear screen and draw everything
+                sys.stdout.write("\033[2J\033[H")  # Clear screen and move to top
+                sys.stdout.write("\r\n".join(screen_lines))
+                sys.stdout.flush()
+                
+                # Get key input
+                key = sys.stdin.read(1)
+                
+                if key == '\x1b':  # ESC sequence
+                    seq = sys.stdin.read(2)
+                    if seq == '[A':  # Up arrow
+                        selected_index = max(0, selected_index - 1)
+                    elif seq == '[B':  # Down arrow
+                        selected_index = min(len(sessions_list) - 1, selected_index + 1)
+                elif key == '\r' or key == '\n':  # Enter
+                    action = 'load'
+                    break
+                elif key == 'd' and allow_delete:  # Delete
+                    # Show confirmation prompt
+                    session = sessions_list[selected_index]
+                    confirm_lines = [
+                        f"{Colors.YELLOW}Confirm Delete{Colors.RESET}",
+                        "",
+                        "Are you sure you want to delete this session?",
+                        "",
+                        f"Session ID: {session['id']}",
+                        f"Role: {session.get('role', 'Session')}",
+                        f"Status: {session['status']}",
+                        f"Working Dir: {session['working_dir']}",
+                        "",
+                        f"{Colors.RED}This will delete all logs and cannot be undone!{Colors.RESET}",
+                        "",
+                        "Press 'y' to confirm, any other key to cancel"
+                    ]
+                    
+                    sys.stdout.write("\033[2J\033[H")  # Clear screen
+                    sys.stdout.write("\r\n".join(confirm_lines))
+                    sys.stdout.flush()
+                    
+                    confirm_key = sys.stdin.read(1)
+                    if confirm_key.lower() == 'y':
+                        action = 'delete'
+                        break
+                    # Otherwise continue (redraw the list)
+                elif key == 'q' or key == '\x03':  # q or Ctrl+C
+                    action = 'quit'
+                    break
+            
+            # Clear screen before returning
+            sys.stdout.write("\033[2J\033[H")
+            sys.stdout.flush()
+            
+            if action == 'quit':
+                return None, None
+            else:
+                return sessions_list[selected_index], action
+                
+        finally:
+            # Restore terminal settings
+            termios.tcsetattr(sys.stdin, termios.TCSADRAIN, old_settings)
+    
+    def load_session(self):
+        """Load and resume a previous session"""
+        while True:
+            # Get all sessions sorted by date (newest first)
+            all_sessions = []
+            for session_id, session_data in self.sessions.items():
+                session_info = session_data.copy()
+                session_info['id'] = session_id
+                all_sessions.append(session_info)
+            
+            # Sort by started_at descending
+            all_sessions.sort(key=lambda x: x['started_at'], reverse=True)
+            
+            if not all_sessions:
+                self.cli_log("No sessions found to load.", log_type='warning')
+                return
+            
+            # Show interactive selector
+            selected_session, action = self.interactive_session_selector(all_sessions, allow_delete=True)
+            
+            if not selected_session:
+                self.cli_log("No session selected.", log_type='info')
+                return
+            
+            if action == 'delete':
+                self.delete_session(selected_session['id'])
+                # Continue loop to show updated list
+                continue
+            elif action == 'load':
+                # Check if it's a PM session with team members
+                if selected_session.get('role') == 'Project Manager':
+                    # Find all team members created by this PM
+                    team_sessions = []
+                    for sid, sdata in self.sessions.items():
+                        if sdata.get('created_by_pm') == selected_session['id']:
+                            team_session_info = sdata.copy()
+                            team_session_info['id'] = sid
+                            team_sessions.append(team_session_info)
+                    
+                    if team_sessions:
+                        self.cli_log(f"Found PM session with {len(team_sessions)} team members", log_type='info')
+                        self.resume_pm_session(selected_session, team_sessions)
+                    else:
+                        # PM without team members, resume as regular session
+                        self.resume_session(selected_session)
+                else:
+                    # Regular session
+                    self.resume_session(selected_session)
+                return
+    
+    def delete_session(self, session_id):
+        """Delete a session and its associated data"""
+        self.cli_log(f"Deleting session {session_id}...", log_type='info')
+        
+        # Delete from sessions
+        if session_id in self.sessions:
+            del self.sessions[session_id]
+            self.save_sessions()
+        
+        # Delete log files
+        log_files = [
+            self.logs_dir / f"{session_id}.log",
+            self.logs_dir / f"{session_id}_prompts.log"
+        ]
+        
+        for log_file in log_files:
+            if log_file.exists():
+                try:
+                    log_file.unlink()
+                    self.cli_log(f"Deleted {log_file.name}", log_type='info')
+                except Exception as e:
+                    self.cli_log(f"Failed to delete {log_file.name}: {e}", log_type='error')
+        
+        # Delete status file
+        status_file = self.status_dir / f"{session_id}.json"
+        if status_file.exists():
+            try:
+                status_file.unlink()
+            except:
+                pass
+        
+        self.cli_log(f"Session {session_id} deleted.", log_type='success', color=Colors.GREEN)
+    
+    def resume_session(self, session_data):
+        """Resume a previous session"""
+        session_id = session_data['id']
+        working_dir = session_data['working_dir']
+        role = session_data.get('role', 'Session')
+        
+        self.cli_log(f"Resuming session {session_id}...", log_type='info')
+        self.cli_log(f"Role: {role}", log_type='info')
+        self.cli_log(f"Working directory: {working_dir}", log_type='info')
+        
+        # Check if directory still exists
+        if not os.path.exists(working_dir):
+            self.cli_log(f"Working directory no longer exists: {working_dir}", log_type='error')
+            return
+        
+        # Update session status
+        self.sessions[session_id]['status'] = 'resuming'
+        self.sessions[session_id]['resumed_at'] = datetime.now().isoformat()
+        self.save_sessions()
+        
+        # Initialize MCP server if not already started
+        if self.mcp_enabled and not self.mcp_server:
+            self.cli_log("Initializing MCP server...", log_type='info', color=Colors.PURPLE)
+            self.init_mcp_server()
+        
+        # Create project-scoped MCP configuration
+        if self.mcp_enabled and self.mcp_server:
+            self.cli_log(f"Creating MCP configuration in {working_dir}", log_type='info', color=Colors.PURPLE)
+            self.create_project_mcp_config(working_dir)
+            self.create_claude_settings(working_dir)
+        
+        # Use the simplified resume method
+        self._resume_single_session(session_id, session_data, is_pm=False, index=1)
+        
+        # Monitor the existing session without creating a new one
+        self.monitor_single_session(session_id, working_dir, watch_mode=True)
+    
+    def resume_pm_session(self, pm_session_data, team_sessions):
+        """Resume a PM session with its team"""
+        pm_session_id = pm_session_data['id']
+        working_dir = pm_session_data['working_dir']
+        
+        self.cli_log("Resuming PM session with team...", log_type='info', prefix='[PM]')
+        
+        # Initialize MCP server if not already started
+        if self.mcp_enabled and not self.mcp_server:
+            self.cli_log("Initializing MCP server...", log_type='info', color=Colors.PURPLE)
+            self.init_mcp_server()
+        
+        # Create project-scoped MCP configuration
+        if self.mcp_enabled and self.mcp_server:
+            self.cli_log(f"Creating MCP configuration in {working_dir}", log_type='info', color=Colors.PURPLE)
+            self.create_project_mcp_config(working_dir)
+            self.create_claude_settings(working_dir)
+        
+        # Resume PM session first
+        self.cli_log("Resuming Project Manager...", log_type='info', prefix='[PM]')
+        self._resume_single_session(pm_session_id, pm_session_data, is_pm=True)
+        
+        # Resume each team member
+        worker_sessions = []
+        for i, team_session in enumerate(team_sessions, 1):
+            team_session_id = team_session['id']
+            team_session_data = self.sessions[team_session_id]
+            
+            self.cli_log(f"Resuming {team_session['role']}...", log_type='info', prefix=f'[{i}]')
+            self._resume_single_session(team_session_id, team_session_data, index=i)
+            worker_sessions.append(team_session_id)
+        
+        # Start unified monitoring for PM and all workers
+        self._start_unified_monitoring(pm_session_id, worker_sessions, watch_mode=True)
+    
+    def _resume_single_session(self, session_id, session_data, is_pm=False, index=1):
+        """Resume a single session without context prompt"""
+        working_dir = session_data['working_dir']
+        role = session_data.get('role', 'Session')
+        
+        # Register in active sessions
+        self.active_sessions[session_id] = {
+            'index': 0 if is_pm else index,
+            'working_dir': working_dir,
+            'created_at': session_data.get('started_at'),
+            'resumed_at': datetime.now().isoformat(),
+            'role': role
+        }
+        
+        # Initialize monitoring structures
+        self.current_status[session_id] = 'idle'
+        self.watch_modes[session_id] = False if is_pm else True  # PM doesn't auto-continue
+        self.auto_continue_counts[session_id] = 0
+        self.has_seen_first_prompt[session_id] = True  # Don't auto-continue until user interacts
+        
+        # Create hooks config
+        self.create_hooks_config(session_id)
+        
+        # Launch Claude without any initial prompt
+        claude_cmd = self.config['claude_code_command'] + ' --dangerously-skip-permissions'
+        
+        applescript = f'''
+        tell application "Terminal"
+            activate
+            set newTab to do script "cd '{working_dir}' && {claude_cmd}"
+            set windowId to id of window 1
+            set tabIndex to 1
+            repeat with t in tabs of window 1
+                if t is newTab then
+                    exit repeat
+                end if
+                set tabIndex to tabIndex + 1
+            end repeat
+            return "" & windowId & "," & tabIndex
+        end tell
+        '''
+        
+        launch_time = time.time()
+        result = subprocess.run(['osascript', '-e', applescript], capture_output=True, text=True)
+        
+        if result.returncode == 0:
+            # Parse window and tab info
+            try:
+                window_tab_info = result.stdout.strip()
+                if ',' in window_tab_info:
+                    window_id, tab_index = window_tab_info.split(',')
+                    self.sessions[session_id]['terminal_window_id'] = int(window_id)
+                    self.sessions[session_id]['terminal_tab_index'] = int(tab_index)
+                    
+                    prefix = '[PM]' if is_pm else f'[{index}]'
+                    self.cli_log(f"Resumed {role} in Terminal (Window: {window_id}, Tab: {tab_index})", 
+                               log_type='launch', prefix=prefix)
+            except Exception as e:
+                self.logger.error(f"Error parsing window info: {e}")
+        
+        # Update session status
+        self.sessions[session_id]['status'] = 'running'
+        self.save_sessions()
+        
+        # Start monitoring threads
+        monitor_thread = threading.Thread(
+            target=self.simple_monitor_session,
+            args=(session_id, launch_time),
+            daemon=True
+        )
+        monitor_thread.start()
+        
+        status_thread = threading.Thread(
+            target=self.monitor_status,
+            args=(session_id,),
+            daemon=True
+        )
+        status_thread.start()
 
     def start_multi_session_and_monitor(self, working_dir=None, watch_mode=False, max_turns=None, num_instances=2):
         """Start multiple Claude sessions and monitor them concurrently"""
@@ -2383,9 +3061,10 @@ Start by analyzing the project and creating your team."""
                     'created_by_pm': pm_session_id
                 }
                 
-                # Also update the persistent session data with role
+                # Also update the persistent session data with role and PM tracking
                 if session_id in self.sessions:
                     self.sessions[session_id]['role'] = role_title
+                    self.sessions[session_id]['created_by_pm'] = pm_session_id
                     self.save_sessions()
                 
                 self.watch_modes[session_id] = watch_mode
@@ -2710,6 +3389,9 @@ def main():
     # Version command
     version_parser = subparsers.add_parser('version', help='Show CCMaster version')
     
+    # Load command
+    load_parser = subparsers.add_parser('load', help='Load and resume a previous session')
+    
     # MCP management commands
     mcp_parser = subparsers.add_parser('mcp', help='MCP management commands')
     mcp_subparsers = mcp_parser.add_subparsers(dest='mcp_command', help='MCP commands')
@@ -2736,6 +3418,8 @@ def main():
     def cleanup():
         cc.stop_mcp_server()
         cc.should_stop = True
+        # Kill all active Claude sessions on exit
+        cc.kill_all_active_sessions()
     
     # Register cleanup for graceful shutdown
     import atexit
@@ -2764,6 +3448,8 @@ def main():
             cc.cli_log(f"CCMaster version {__version__}", log_type='info')
             cc.cli_log("Claude Code Session Manager", log_type='launch')
             cc.cli_log("https://github.com/yourusername/ccmaster", log_type='info')
+        elif args.command == 'load':
+            cc.load_session()
         elif args.command == 'mcp':
             if args.mcp_command == 'remove':
                 cc.remove_from_mcp_config(args.dir)

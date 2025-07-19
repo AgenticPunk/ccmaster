@@ -4,6 +4,10 @@ PM (Project Manager) Mode is a new feature in CCMaster that enables true team co
 
 > **Note**: CCMaster now uses a file-based approach for sending prompts to Claude instances, eliminating input method conflicts. This ensures reliable prompt delivery even with Chinese or other non-ASCII input methods.
 
+> **Important**: All Claude sessions (including PM and team members) automatically close when CCMaster exits. You can resume any session later using `ccmaster load`.
+
+> **PM Session Recovery**: When you load a PM session, all team members created by that PM are automatically resumed together, recreating the full team environment.
+
 ## Key Features: True Team Collaboration
 
 - **Shared Workspace**: All team members work in the same directory
