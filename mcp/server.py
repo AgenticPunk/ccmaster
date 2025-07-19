@@ -89,12 +89,17 @@ class MCPServer:
             def emit(self, record):
                 try:
                     msg = self.format(record)
-                    if hasattr(self.ccmaster, 'print_lock'):
-                        with self.ccmaster.print_lock:
-                            timestamp = time.strftime('%H:%M:%S')
-                            # Only show important messages, filter out HTTP requests
-                            if "HTTP/1.1" not in msg and "POST /" not in msg:
-                                print(f"[{timestamp}] ◆ MCP: {msg}")
+                    # Only show important messages, filter out HTTP requests
+                    if "HTTP/1.1" not in msg and "POST /" not in msg:
+                        # Use ccmaster's cli_log for proper alignment
+                        if hasattr(self.ccmaster, 'cli_log'):
+                            self.ccmaster.cli_log(f"MCP: {msg}", log_type='info')
+                        else:
+                            # Fallback only if cli_log not available
+                            if hasattr(self.ccmaster, 'print_lock'):
+                                with self.ccmaster.print_lock:
+                                    timestamp = time.strftime('%H:%M:%S')
+                                    print(f"[{timestamp}] ◆ MCP: {msg}")
                 except Exception:
                     self.handleError(record)
         
