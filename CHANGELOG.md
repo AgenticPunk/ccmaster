@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- **Input Method Conflict**: Fixed issue where sending prompts to Claude instances would conflict with input methods
+  - Replaced keystroke-based input with file-based approach using temporary files
+  - All prompts (initial and auto-continue) now use `cat` command to avoid focus switching
+  - Resolves issues with Chinese and other non-ASCII input methods
+  - Affects both regular sessions and MCP-created sessions
+
 ## [2.0.0] - 2025-01-18
 
 ### Added
