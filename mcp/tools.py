@@ -13,6 +13,7 @@ import time
 from typing import Dict, Any, List, Optional
 from datetime import datetime
 from pathlib import Path
+from .project_communication import ProjectCommunication, TaskStatus, TaskPriority
 
 
 class SessionTools:
@@ -20,6 +21,11 @@ class SessionTools:
     
     def __init__(self, ccmaster_instance):
         self.ccmaster = ccmaster_instance
+        
+        # Initialize project communication lazily when needed
+        self.project_comm = None
+        self._project_comm_initialized = False
+        
         self.tools = {
             "list_sessions": self.list_sessions,
             "get_session_status": self.get_session_status,
@@ -33,7 +39,12 @@ class SessionTools:
             "get_team_info": self.get_team_info,
             "broadcast_to_team": self.broadcast_to_team,
             "wait_for_dependency": self.wait_for_dependency,
-            "notify_completion": self.notify_completion
+            "notify_completion": self.notify_completion,
+            # New task-based tools
+            "create_task": self.create_task,
+            "get_my_tasks": self.get_my_tasks,
+            "update_task_status": self.update_task_status,
+            "get_team_messages": self.get_team_messages
         }
     
     def get_tool_definitions(self) -> List[Dict[str, Any]]:
@@ -283,8 +294,120 @@ class SessionTools:
                     },
                     "required": ["task_description", "output_details"]
                 }
+            },
+            {
+                "name": "create_task",
+                "description": "Create a structured task in the project .ccmaster/tasks directory",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "title": {
+                            "type": "string",
+                            "description": "Short title for the task"
+                        },
+                        "description": {
+                            "type": "string",
+                            "description": "Detailed description of what needs to be done"
+                        },
+                        "assigned_to": {
+                            "type": "string",
+                            "description": "Session ID of the team member to assign this task to"
+                        },
+                        "priority": {
+                            "type": "string",
+                            "enum": ["low", "medium", "high", "urgent"],
+                            "description": "Task priority level",
+                            "default": "medium"
+                        },
+                        "task_type": {
+                            "type": "string",
+                            "enum": ["feature", "bug", "refactor", "test", "docs"],
+                            "description": "Type of task",
+                            "default": "feature"
+                        },
+                        "acceptance_criteria": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                            "description": "List of criteria that must be met for the task to be considered complete"
+                        }
+                    },
+                    "required": ["title", "description", "assigned_to"]
+                }
+            },
+            {
+                "name": "get_my_tasks",
+                "description": "Get tasks assigned to a specific session from .ccmaster/tasks",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "session_id": {
+                            "type": "string",
+                            "description": "Session ID to get tasks for"
+                        },
+                        "status": {
+                            "type": "string",
+                            "enum": ["pending", "in_progress", "blocked", "completed", "cancelled"],
+                            "description": "Filter by task status (optional)"
+                        }
+                    },
+                    "required": ["session_id"]
+                }
+            },
+            {
+                "name": "update_task_status",
+                "description": "Update the status of a task in .ccmaster/tasks",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "task_id": {
+                            "type": "string",
+                            "description": "ID of the task to update"
+                        },
+                        "status": {
+                            "type": "string",
+                            "enum": ["pending", "in_progress", "blocked", "completed", "cancelled"],
+                            "description": "New status for the task"
+                        },
+                        "output": {
+                            "type": "string",
+                            "description": "Output details (for completed tasks)"
+                        },
+                        "blocker": {
+                            "type": "string",
+                            "description": "Description of what's blocking the task (for blocked status)"
+                        }
+                    },
+                    "required": ["task_id", "status"]
+                }
+            },
+            {
+                "name": "get_team_messages",
+                "description": "Get unread messages for a session from .ccmaster/messages",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "session_id": {
+                            "type": "string",
+                            "description": "Session ID to get messages for"
+                        }
+                    },
+                    "required": ["session_id"]
+                }
             }
         ]
+    
+    def _ensure_project_comm(self):
+        """Lazily initialize project communication when first needed"""
+        if not self._project_comm_initialized:
+            self._project_comm_initialized = True
+            try:
+                working_dir = os.getcwd()
+                self.project_comm = ProjectCommunication(working_dir)
+                if hasattr(self.ccmaster, 'cli_log'):
+                    self.ccmaster.cli_log("Project communication initialized in .ccmaster/", log_type='info', color='\033[92m')
+            except Exception as e:
+                if hasattr(self.ccmaster, 'logger'):
+                    self.ccmaster.logger.warning(f"Could not initialize project communication: {e}")
     
     def list_sessions(self, include_ended: bool = False) -> Dict[str, Any]:
         """List all active sessions"""
@@ -517,16 +640,30 @@ class SessionTools:
                     # Set up monitoring threads - use simple_monitor_session for multi-session compatibility
                     import time
                     
-                    # Send initial prompt if provided
+                    # Save initial prompt if provided
                     if initial_prompt:
+                        self._ensure_project_comm()
+                        if self.project_comm:
+                            # Save prompt to project communication system
+                            prompt_file = self.project_comm.save_initial_prompt(session_id, initial_prompt, role)
+                            self.ccmaster.cli_log(f"Saved initial prompt for {role or 'Team Member'} to project .ccmaster/", log_type='info')
+                        
                         # Wait a bit for Claude to fully start
                         time.sleep(3)
                         
-                        # Send the initial prompt
+                        # Send the initial prompt using the new system
                         self.ccmaster.cli_log(f"Sending initial prompt to {role or 'Team Member'}", log_type='info')
                         success = self.ccmaster.send_continue_to_claude(session_id, initial_prompt)
                         if success:
                             self.ccmaster.cli_log(f"Initial prompt sent successfully", log_type='info', color='\033[92m')  # GREEN
+                        else:
+                            self.ccmaster.cli_log(f"Failed to send initial prompt", log_type='warning')
+                    elif initial_prompt:
+                        # Fallback to old method if project communication not available
+                        time.sleep(3)
+                        success = self.ccmaster.send_continue_to_claude(session_id, initial_prompt)
+                        if success:
+                            self.ccmaster.cli_log(f"Initial prompt sent (using temp file)", log_type='info')
                         else:
                             self.ccmaster.cli_log(f"Failed to send initial prompt", log_type='warning')
                     launch_time = time.time()
@@ -966,3 +1103,172 @@ You can now proceed with any tasks that depend on this completion.
             
         except Exception as e:
             return {"error": f"Failed to notify completion: {str(e)}"}
+    
+    def create_task(self, title: str, description: str, assigned_to: str, 
+                   priority: str = "medium", task_type: str = "feature",
+                   acceptance_criteria: List[str] = None) -> Dict[str, Any]:
+        """Create a task in the project .ccmaster/tasks directory"""
+        try:
+            self._ensure_project_comm()
+            if not self.project_comm:
+                return {"error": "Project communication not initialized. Not in a project directory?"}
+            
+            # Get PM session ID (could be passed or determined from context)
+            created_by = "pm_session"  # Default for now
+            
+            # Convert priority string to enum
+            priority_enum = TaskPriority.MEDIUM
+            if priority.lower() == "low":
+                priority_enum = TaskPriority.LOW
+            elif priority.lower() == "high":
+                priority_enum = TaskPriority.HIGH
+            elif priority.lower() == "urgent":
+                priority_enum = TaskPriority.URGENT
+            
+            task = self.project_comm.create_task(
+                title=title,
+                description=description,
+                assigned_to=assigned_to,
+                created_by=created_by,
+                priority=priority_enum,
+                task_type=task_type,
+                acceptance_criteria=acceptance_criteria
+            )
+            
+            self.ccmaster.cli_log(
+                f"✅ Task created: {task['id']} - {title} (assigned to: {assigned_to})",
+                log_type='mcp',
+                color='\033[92m'  # GREEN
+            )
+            
+            # Also send a message to notify the assignee
+            if hasattr(self, 'send_message_to_session'):
+                msg = f"New task assigned: {title}\nPriority: {priority}\nCheck your tasks with /mcp__ccmaster__get_my_tasks"
+                self.send_message_to_session(assigned_to, msg)
+            
+            return {
+                "success": True,
+                "task": task
+            }
+            
+        except Exception as e:
+            return {"error": f"Failed to create task: {str(e)}"}
+    
+    def get_my_tasks(self, session_id: str, status: str = None) -> Dict[str, Any]:
+        """Get tasks assigned to a specific session"""
+        try:
+            self._ensure_project_comm()
+            if not self.project_comm:
+                return {"error": "Project communication not initialized. Not in a project directory?"}
+            
+            # Convert status string to enum if provided
+            status_enum = None
+            if status:
+                status_map = {
+                    "pending": TaskStatus.PENDING,
+                    "in_progress": TaskStatus.IN_PROGRESS,
+                    "blocked": TaskStatus.BLOCKED,
+                    "completed": TaskStatus.COMPLETED,
+                    "cancelled": TaskStatus.CANCELLED
+                }
+                status_enum = status_map.get(status.lower())
+            
+            tasks = self.project_comm.get_tasks_for_session(session_id, status_enum)
+            
+            # Update session status in project directory
+            if self.project_comm:
+                current_task = None
+                for task in tasks:
+                    if task['status'] == 'in_progress':
+                        current_task = task['id']
+                        break
+                
+                self.project_comm.update_session_status(
+                    session_id,
+                    'working' if current_task else 'idle',
+                    current_task=current_task
+                )
+            
+            return {
+                "success": True,
+                "session_id": session_id,
+                "task_count": len(tasks),
+                "tasks": tasks
+            }
+            
+        except Exception as e:
+            return {"error": f"Failed to get tasks: {str(e)}"}
+    
+    def update_task_status(self, task_id: str, status: str, 
+                          output: str = None, blocker: str = None) -> Dict[str, Any]:
+        """Update the status of a task"""
+        try:
+            self._ensure_project_comm()
+            if not self.project_comm:
+                return {"error": "Project communication not initialized. Not in a project directory?"}
+            
+            # Convert status string to enum
+            status_map = {
+                "pending": TaskStatus.PENDING,
+                "in_progress": TaskStatus.IN_PROGRESS,
+                "blocked": TaskStatus.BLOCKED,
+                "completed": TaskStatus.COMPLETED,
+                "cancelled": TaskStatus.CANCELLED
+            }
+            
+            status_enum = status_map.get(status.lower())
+            if not status_enum:
+                return {"error": f"Invalid status: {status}"}
+            
+            success = self.project_comm.update_task_status(
+                task_id=task_id,
+                new_status=status_enum,
+                output=output,
+                blocker=blocker
+            )
+            
+            if success:
+                self.ccmaster.cli_log(
+                    f"✅ Task {task_id} status updated to: {status}",
+                    log_type='mcp',
+                    color='\033[92m'  # GREEN
+                )
+                
+                # If task is completed, notify PM
+                if status_enum == TaskStatus.COMPLETED:
+                    self.project_comm.broadcast_event("task_completed", {
+                        "task_id": task_id,
+                        "output": output
+                    })
+            
+            return {
+                "success": success,
+                "task_id": task_id,
+                "new_status": status
+            }
+            
+        except Exception as e:
+            return {"error": f"Failed to update task status: {str(e)}"}
+    
+    def get_team_messages(self, session_id: str) -> Dict[str, Any]:
+        """Get unread messages for a session"""
+        try:
+            self._ensure_project_comm()
+            if not self.project_comm:
+                return {"error": "Project communication not initialized. Not in a project directory?"}
+            
+            messages = self.project_comm.get_unread_messages(session_id)
+            
+            # Mark messages as read
+            for msg in messages:
+                self.project_comm.mark_message_read(session_id, msg['id'])
+            
+            return {
+                "success": True,
+                "session_id": session_id,
+                "message_count": len(messages),
+                "messages": messages
+            }
+            
+        except Exception as e:
+            return {"error": f"Failed to get messages: {str(e)}"}

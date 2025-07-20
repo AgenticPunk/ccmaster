@@ -22,6 +22,35 @@ import tty
 import termios
 from datetime import datetime
 from pathlib import Path
+
+# Add parent directory to path for imports
+# Handle both symlinked and direct execution
+script_path = Path(__file__).resolve()  # Resolve symlinks
+ccmaster_root = script_path.parent.parent.parent
+
+# Also try to find ccmaster based on known structure
+if not (ccmaster_root / 'mcp').exists():
+    # Maybe we're running from a different location
+    for parent in script_path.parents:
+        if (parent / 'mcp' / 'project_communication.py').exists():
+            ccmaster_root = parent
+            break
+
+if str(ccmaster_root) not in sys.path:
+    sys.path.insert(0, str(ccmaster_root))
+
+# Import project communication at module level, but initialize later
+try:
+    from mcp.project_communication import ProjectCommunication
+    HAS_PROJECT_COMM = True
+except ImportError as e:
+    HAS_PROJECT_COMM = False
+    # Only print in debug mode to avoid cluttering output
+    if os.environ.get('CCMASTER_DEBUG'):
+        print(f"Warning: Could not import ProjectCommunication: {e}")
+        print(f"Script path: {script_path}")
+        print(f"CCMaster root: {ccmaster_root}")
+        print(f"MCP exists at {ccmaster_root / 'mcp'}: {(ccmaster_root / 'mcp').exists()}")
 import shlex
 import logging
 import re
@@ -103,6 +132,9 @@ class CCMaster:
         self.logger = logging.getLogger('CCMaster')
         self.logger.setLevel(logging.INFO)
         self.logger.handlers = []  # Clear any existing handlers
+        
+        # Initialize project communication (will be set when needed)
+        self.project_comm = None
         
         # Add file handler only
         log_file = self.logs_dir / 'ccmaster.log'
@@ -862,10 +894,30 @@ class CCMaster:
             self.cli_log("No terminal window info stored for this session", log_type='warning')
             return False
         
-        # Write message to a temporary file to avoid input method issues
-        temp_file = tempfile.NamedTemporaryFile(mode='w', suffix='.txt', delete=False)
-        temp_file.write(message)
-        temp_file.close()
+        # Try to use project communication system first
+        message_file_to_use = None
+        use_project_comm = False
+        
+        if self.project_comm:
+            try:
+                # Save message as a prompt file
+                message_file_path = self.project_comm.save_initial_prompt(
+                    f"{session_id}_msg_{datetime.now().strftime('%Y%m%d_%H%M%S')}",
+                    message,
+                    "Message"
+                )
+                message_file_to_use = str(message_file_path)
+                use_project_comm = True
+                self.logger.info(f"Saved message to project comm: {message_file_path}")
+            except Exception as e:
+                self.logger.warning(f"Failed to save message to project comm: {e}")
+        
+        if not message_file_to_use:
+            # Fallback to temporary file
+            temp_file = tempfile.NamedTemporaryFile(mode='w', suffix='.txt', delete=False)
+            temp_file.write(message)
+            temp_file.close()
+            message_file_to_use = temp_file.name
         
         # Use specific window and find Claude tab
         specific_script = f'''
@@ -887,7 +939,7 @@ class CCMaster:
                             delay 0.3
                             
                             -- Use cat command to send message from file
-                            do script "cat '{temp_file.name}'" in t
+                            do script "cat '{message_file_to_use}'" in t
                             delay 0.1
                             -- Send Enter key to submit
                             do script "" in t
@@ -909,14 +961,15 @@ class CCMaster:
             result = subprocess.run(['osascript', '-e', specific_script], 
                                   capture_output=True, text=True, timeout=5)
             
-            # Clean up temp file after a delay
-            def cleanup_temp():
-                time.sleep(1)  # Give time for the command to be read
-                try:
-                    os.unlink(temp_file.name)
-                except:
-                    pass
-            threading.Thread(target=cleanup_temp, daemon=True).start()
+            # Clean up temp file after a delay (only if not using project comm)
+            if not use_project_comm and message_file_to_use:
+                def cleanup_temp():
+                    time.sleep(10)  # Give time for the command to be read
+                    try:
+                        os.unlink(message_file_to_use)
+                    except:
+                        pass
+                threading.Thread(target=cleanup_temp, daemon=True).start()
             
             if result.returncode == 0:
                 output = result.stdout.strip()
@@ -951,11 +1004,12 @@ class CCMaster:
                 self.cli_log(f"Auto-continue error: {str(e)}", log_type='error', prefix=prefix)
             else:
                 self.cli_log(f"Auto-continue error: {str(e)}", log_type='error')
-            # Clean up temp file on error
-            try:
-                os.unlink(temp_file.name)
-            except:
-                pass
+            # Clean up file on error (only if not using project comm)
+            if not use_project_comm and message_file_to_use:
+                try:
+                    os.unlink(message_file_to_use)
+                except:
+                    pass
             return False
     
     def start_session_and_monitor(self, working_dir=None, watch_mode=False, max_turns=None):
@@ -1005,6 +1059,14 @@ class CCMaster:
             
             # Create Claude settings to auto-enable MCP
             self.create_claude_settings(working_dir)
+        
+        # Initialize project communication system if not already initialized
+        if HAS_PROJECT_COMM and not self.project_comm:
+            try:
+                self.project_comm = ProjectCommunication(working_dir)
+                self.cli_log("Initialized project communication in .ccmaster/", log_type='info', color=Colors.GREEN)
+            except Exception as e:
+                self.cli_log(f"Could not initialize project communication: {e}", log_type='warning')
         
         # Create per-session hooks configuration
         settings_file, backup_file = self.create_hooks_config(session_id)
@@ -1716,9 +1778,15 @@ class CCMaster:
         """Monitor the status file for updates"""
         status_file = self.status_dir / f"{session_id}.json"
         
-        # Create an empty status file
-        with open(status_file, 'w') as f:
-            json.dump({'state': 'idle', 'session_id': session_id}, f)
+        # Create an empty status file only if it doesn't exist
+        if not status_file.exists():
+            # Check if we have an initial status for this session
+            initial_state = 'idle'
+            if isinstance(self.current_status, dict) and session_id in self.current_status:
+                initial_state = self.current_status[session_id]
+            
+            with open(status_file, 'w') as f:
+                json.dump({'state': initial_state, 'session_id': session_id}, f)
         
         last_update = None
         
@@ -2330,6 +2398,14 @@ class CCMaster:
             watch_info = " (watch: OFF)"
         self.cli_log(f"Starting {num_instances} sessions{watch_info}", log_type='launch')
         
+        # Initialize project communication system if not already initialized
+        if HAS_PROJECT_COMM and not self.project_comm:
+            try:
+                self.project_comm = ProjectCommunication(working_dir)
+                self.cli_log("Initialized project communication in .ccmaster/", log_type='info', color=Colors.GREEN)
+            except Exception as e:
+                self.cli_log(f"Could not initialize project communication: {e}", log_type='warning')
+        
         # Create all sessions
         session_ids = []
         for i in range(num_instances):
@@ -2645,6 +2721,24 @@ class CCMaster:
             self.create_project_mcp_config(working_dir)
             self.create_claude_settings(working_dir)
         
+        # Initialize project communication system
+        if not HAS_PROJECT_COMM:
+            self.cli_log("ProjectCommunication module not available", log_type='warning', prefix='[PM]')
+        elif not self.project_comm:
+            try:
+                # Add ccmaster directory to Python path to ensure imports work
+                ccmaster_root = Path(__file__).parent.parent.parent
+                if str(ccmaster_root) not in sys.path:
+                    sys.path.insert(0, str(ccmaster_root))
+                
+                from mcp.project_communication import ProjectCommunication
+                self.project_comm = ProjectCommunication(working_dir)
+                self.cli_log("Initialized project communication in .ccmaster/", log_type='info', prefix='[PM]', color=Colors.GREEN)
+            except Exception as e:
+                self.cli_log(f"Could not initialize project communication: {e}", log_type='error', prefix='[PM]')
+                import traceback
+                self.logger.error(f"ProjectCommunication init error: {traceback.format_exc()}")
+        
         # Create PM Claude session
         pm_session_id = self.create_session(working_dir)
         self.active_sessions[pm_session_id] = {
@@ -2666,23 +2760,31 @@ class CCMaster:
         pm_system_prompt = self._get_pm_system_prompt(pm_template)
         full_prompt = f"{pm_system_prompt}\n\nProject Description:\n{project_prompt}"
         
-        # Create temporary file with PM prompt
-        import tempfile
-        with tempfile.NamedTemporaryFile(mode='w', suffix='.txt', delete=False) as f:
-            f.write(full_prompt)
-            prompt_file = f.name
+        # Save PM prompt using project communication or temp file
+        prompt_file_to_use = None
+        if self.project_comm:
+            try:
+                prompt_file_path = self.project_comm.save_initial_prompt(pm_session_id, full_prompt, "Project Manager")
+                self.cli_log(f"Saved PM prompt to .ccmaster/prompts/{pm_session_id}_prompt.json", log_type='info', prefix='[PM]', color=Colors.GREEN)
+                prompt_file_to_use = str(prompt_file_path)
+            except Exception as e:
+                self.cli_log(f"Failed to save prompt to project comm: {e}", log_type='error', prefix='[PM]')
+                self.project_comm = None  # Reset so we fall back to temp file
+        
+        if not prompt_file_to_use:
+            # Fallback to temporary file if project comm not available or failed
+            self.cli_log("Using temporary file for PM prompt", log_type='warning', prefix='[PM]')
+            import tempfile
+            temp_file = tempfile.NamedTemporaryFile(mode='w', suffix='.txt', delete=False)
+            temp_file.write(full_prompt)
+            temp_file.close()
+            prompt_file_to_use = temp_file.name
         
         # Prepare Claude Code command (without redirection - we'll send prompt via applescript)
         claude_cmd = f"{self.config['claude_code_command']} --dangerously-skip-permissions"
         
         # Launch PM Claude
         self.cli_log("Launching PM Claude to analyze project...", log_type='info', prefix='[PM]')
-        
-        # Write prompt to a temporary file to avoid clipboard and shell escaping issues
-        import tempfile
-        temp_file = tempfile.NamedTemporaryFile(mode='w', suffix='.txt', delete=False)
-        temp_file.write(full_prompt)
-        temp_file.close()
         
         # AppleScript that launches Claude and sends the prompt via cat command
         applescript = f'''
@@ -2692,7 +2794,7 @@ class CCMaster:
             set newTab to do script "cd '{working_dir}' && {claude_cmd}"
             delay 5
             -- Then send the prompt content using cat and press Enter
-            do script "cat '{temp_file.name}'" in newTab
+            do script "cat '{prompt_file_to_use}'" in newTab
             delay 1
             -- Send Enter key to submit
             do script "" in newTab
@@ -2736,15 +2838,15 @@ class CCMaster:
         
         # Note: PM will use MCP tools to create instances, so the JSON monitoring is mainly for backup
         
-        # Clean up prompt files after a delay
-        def cleanup_prompts():
-            time.sleep(10)  # Give more time for the prompt to be read
-            try:
-                os.unlink(prompt_file)
-                os.unlink(temp_file.name)
-            except:
-                pass
-        threading.Thread(target=cleanup_prompts, daemon=True).start()
+        # Clean up temp file if used (project comm files are persistent)
+        if not self.project_comm and prompt_file_to_use:
+            def cleanup_temp():
+                time.sleep(10)  # Give time for the prompt to be read
+                try:
+                    os.unlink(prompt_file_to_use)
+                except:
+                    pass
+            threading.Thread(target=cleanup_temp, daemon=True).start()
         
         # Start monitoring threads for PM session
         monitor_thread = threading.Thread(
@@ -2762,9 +2864,9 @@ class CCMaster:
         status_thread.start()
         
         # Initialize tracking for PM session
-        self.current_status[pm_session_id] = 'idle'
+        self.current_status[pm_session_id] = 'processing'  # PM is processing the initial prompt
         self.watch_modes[pm_session_id] = False  # PM never auto-continues
-        self.has_seen_first_prompt[pm_session_id] = True  # PM already got initial prompt
+        self.has_seen_first_prompt[pm_session_id] = False  # PM hasn't processed the prompt yet
         
         self.cli_log("PM Claude is ready. You can update project requirements at any time.", log_type='info', prefix='[PM]')
         self.cli_log("PM will analyze and create new instances whenever you provide new requirements.", log_type='info', prefix='[PM]')
@@ -2784,7 +2886,7 @@ class CCMaster:
 IMPORTANT: You have access to powerful MCP tools for team management:
 
 1. **Creating Team Members**:
-   /mcp__ccmaster__create_session working_dir="." watch_mode=true role="Frontend Developer" initial_prompt="You are a Frontend Developer. Your task is..."
+   /mcp__ccmaster__create_session working_dir="." watch_mode=false role="Frontend Developer" initial_prompt="You are a Frontend Developer. Your task is..."
 
 2. **Getting Team Information**:
    /mcp__ccmaster__get_team_info
@@ -2822,7 +2924,7 @@ CREATING COLLABORATIVE TEAM MEMBERS:
 When creating team members, ensure they understand team collaboration:
 
 Example for Frontend Developer:
-/mcp__ccmaster__create_session working_dir="." watch_mode=true role="Frontend Developer" initial_prompt="You are a Frontend Developer specializing in React, part of a collaborative development team.
+/mcp__ccmaster__create_session working_dir="." watch_mode=false role="Frontend Developer" initial_prompt="You are a Frontend Developer specializing in React, part of a collaborative development team.
 
 TEAM COLLABORATION TOOLS:
 - /mcp__ccmaster__get_team_info - See all team members and their roles
@@ -2837,6 +2939,12 @@ COLLABORATION EXPECTATIONS:
 3. Notify relevant team members when you complete important work
 4. If blocked, use wait_for_dependency to coordinate
 5. Broadcast important updates that affect the whole team
+
+TASK COMPLETION:
+- When your assigned task is complete, notify PM and stop working
+- Do NOT continue adding features unless explicitly asked
+- If you receive 'continue' without a specific task, respond with your current status
+- Wait for new instructions from PM rather than creating new work
 
 Your specific task: [TASK DESCRIPTION]"
 

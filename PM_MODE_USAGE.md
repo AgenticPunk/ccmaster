@@ -51,7 +51,7 @@ PM Mode enables true team collaboration through MCP tools. Each team member has 
 ### Creating Collaborative Team Members
 PM Claude creates team members with full collaboration capabilities:
 ```
-/mcp__ccmaster__create_session working_dir="." watch_mode=true role="Frontend Developer" initial_prompt="You are a Frontend Developer specializing in React, part of a collaborative development team.
+/mcp__ccmaster__create_session working_dir="." watch_mode=false role="Frontend Developer" initial_prompt="You are a Frontend Developer specializing in React, part of a collaborative development team.
 
 TEAM COLLABORATION TOOLS:
 - /mcp__ccmaster__get_team_info - See all team members and their roles
@@ -172,13 +172,13 @@ ccmaster pm "Build a real-time chat application with user authentication"
 Based on the project requirements, I'll create the optimal team composition.
 
 Creating Frontend Developer...
-/mcp__ccmaster__create_session working_dir="." watch_mode=true initial_prompt="You are a Frontend Developer specializing in React. Create a real-time chat UI with user authentication forms..."
+/mcp__ccmaster__create_session working_dir="." watch_mode=false initial_prompt="You are a Frontend Developer specializing in React. Create a real-time chat UI with user authentication forms..."
 
 Creating Backend Developer...
-/mcp__ccmaster__create_session working_dir="." watch_mode=true initial_prompt="You are a Backend Developer specializing in Node.js. Implement WebSocket server and authentication APIs..."
+/mcp__ccmaster__create_session working_dir="." watch_mode=false initial_prompt="You are a Backend Developer specializing in Node.js. Implement WebSocket server and authentication APIs..."
 
 Creating DevOps Engineer...
-/mcp__ccmaster__create_session working_dir="." watch_mode=true initial_prompt="You are a DevOps Engineer. Set up Docker containers and deployment pipeline..."
+/mcp__ccmaster__create_session working_dir="." watch_mode=false initial_prompt="You are a DevOps Engineer. Set up Docker containers and deployment pipeline..."
 
 Team creation complete! I've created 3 specialized Claude instances to work on your project.
 ```
@@ -240,7 +240,7 @@ PM: /mcp__ccmaster__send_message_to_session session_id="backend_dev" message="Ba
 # PM responds:
 "Adding video chat requires specialized expertise. Creating additional team members..."
 
-/mcp__ccmaster__create_session working_dir="." watch_mode=true initial_prompt="You are a WebRTC Specialist. Implement peer-to-peer video chat..."
+/mcp__ccmaster__create_session working_dir="." watch_mode=false initial_prompt="You are a WebRTC Specialist. Implement peer-to-peer video chat..."
 
 # PM coordinates with existing team:
 /mcp__ccmaster__send_message_to_session session_id="frontend_dev" message="New team member joining for video chat. Please prepare UI space for video elements"
@@ -387,4 +387,4 @@ This is normal! PM Claude uses MCP tools to create instances, which happens quic
 - New instances appear with incrementing indices ([1], [2], etc.)
 - PM session never receives auto-continue commands
 - Monitor runs quietly in background, only reporting when JSON blocks are found
-- Temporary files are cleaned up after 10 seconds
+- Temporary files are cleaned up after 10 seconds (increased from 1 second to fix long prompt issues)
